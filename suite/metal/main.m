@@ -11,6 +11,7 @@
 #include <sys/sysctl.h>
 
 #include "gb_common.h"
+#include "gb_mesh.h"
 #include "gb_params.h"
 #include "msl_sources.h"
 
@@ -1031,6 +1032,451 @@ static const struct mtest t_render_tvb = {.name = "render.tvb", .known = tvb_par
                                           .report_first = true, .setup = tvb_setup, .encode = r_encode,
                                           .derive = tvb_derive};
 
+/* ---- render.mesh ----
+ * One drawMeshThreadgroups per command buffer into a res x res RGBA8 target
+ * (a 2-slice array for views=2). The MSL (shaders/mesh.metal) is compiled per
+ * configuration with the same macros as the GLSL variants; the workload
+ * definition and the topo=line check are gb_mesh.h, shared with gb_vk.
+ * views=2 uses vertex amplification by default; GB_MESH_MTL_VIEWS=layer
+ * switches to twice the mesh groups with a per-primitive layer, and
+ * GB_MESH_MTL_LAYER_OUT=0 drops the (zero) per-primitive layer under
+ * amplification. Both are recorded in the result's "pipeline" object. */
+
+@interface GBMesh : NSObject {
+@public
+   struct gb_mesh_cfg c;
+   bool amp, layer_out, check_each;
+   int ntargets;
+   bool *used;
+   struct gb_mesh_ver ver;
+   struct gb_check each, last;
+   bool have_last;
+   MTLVertexAmplificationViewMapping maps[2];
+}
+@property(nonatomic, strong) id<MTLRenderPipelineState> ps;
+@property(nonatomic, strong) NSArray *targets; /* id<MTLTexture>, one or one per ring slot */
+@property(nonatomic, strong) NSArray *rbs;     /* id<MTLBuffer>, --check-each */
+@property(nonatomic, strong) NSArray *fences;  /* id<MTLFence>, --check-each */
+@property(nonatomic, strong) MTLMeshRenderPipelineDescriptor *desc;
+@property(nonatomic, copy) NSString *macros;
+@end
+@implementation GBMesh
+- (void)dealloc
+{
+   free(used);
+   gb_mesh_ver_free(&ver);
+}
+@end
+
+static id<MTLTexture>
+mesh_mtl_target(const struct gb_mesh_cfg *c)
+{
+   MTLTextureDescriptor *d = [MTLTextureDescriptor texture2DDescriptorWithPixelFormat:MTLPixelFormatRGBA8Unorm
+                                                                                width:c->res
+                                                                               height:c->res
+                                                                            mipmapped:NO];
+   if (c->views > 1) {
+      d.textureType = MTLTextureType2DArray;
+      d.arrayLength = c->views;
+   }
+   d.storageMode = MTLStorageModePrivate;
+   d.usage = MTLTextureUsageRenderTarget;
+   d.hazardTrackingMode = MTLHazardTrackingModeUntracked;
+   id<MTLTexture> t = [g_dev newTextureWithDescriptor:d];
+   if (!t)
+      gb_die("mesh target %ux%ux%u failed", c->res, c->res, c->views);
+   return t;
+}
+
+/* Blit every slice of `t` to `b` (views x res^2 words). */
+static void
+mesh_mtl_copy_out(id<MTLBlitCommandEncoder> e, const struct gb_mesh_cfg *c, id<MTLTexture> t, id<MTLBuffer> b)
+{
+   const NSUInteger row = (NSUInteger)c->res * 4, img = row * c->res;
+   for (uint32_t v = 0; v < c->views; v++)
+      [e copyFromTexture:t
+                 sourceSlice:v
+                 sourceLevel:0
+                sourceOrigin:MTLOriginMake(0, 0, 0)
+                  sourceSize:MTLSizeMake(c->res, c->res, 1)
+                    toBuffer:b
+           destinationOffset:v * img
+      destinationBytesPerRow:row
+    destinationBytesPerImage:img];
+}
+
+static id
+mesh_mtl_setup(const struct gb_opts *o, char *err, size_t n)
+{
+   struct gb_mesh_cfg c;
+   const char *why = gb_mesh_parse(o, &c);
+   if (why) {
+      snprintf(err, n, "%s", why);
+      return nil;
+   }
+   if (@available(macOS 13.0, *)) {
+   } else {
+      snprintf(err, n, "mesh shaders need macOS 13");
+      return nil;
+   }
+   if (![g_dev supportsFamily:MTLGPUFamilyApple7] && ![g_dev supportsFamily:MTLGPUFamilyMac2]) {
+      snprintf(err, n, "device has no mesh shading (needs Apple7 or Mac2 family)");
+      return nil;
+   }
+   GBMesh *m = [GBMesh new];
+   m->c = c;
+   const char *ev = getenv("GB_MESH_MTL_VIEWS"), *el = getenv("GB_MESH_MTL_LAYER_OUT");
+   m->amp = c.views > 1 && !(ev && !strcmp(ev, "layer"));
+   m->layer_out = c.views > 1 && (!m->amp || !(el && !strcmp(el, "0")));
+   if (m->amp && ![g_dev supportsVertexAmplificationCount:c.views]) {
+      snprintf(err, n, "vertex amplification count %u not supported (try GB_MESH_MTL_VIEWS=layer)", c.views);
+      return nil;
+   }
+   /* Apple9's documented limit of threadgroups in one mesh grid. */
+   if (!c.task && (uint64_t)c.groups * (m->amp ? 1 : c.views) > 1048575) {
+      snprintf(err, n, "more than 1048575 mesh threadgroups in one draw");
+      return nil;
+   }
+
+   /* The library for this configuration. */
+   NSDictionary *macros = @{
+      @"WG" : @(c.wg),
+      @"TOPO_LINE" : @(c.line ? 1 : 0),
+      @"SHAPE_VERT" : @(c.vert ? 1 : 0),
+      @"PERPRIM" : @(c.perprim ? 1 : 0),
+      @"VIEWS" : @(c.views),
+      @"TASK" : @(c.task ? 1 : 0),
+      @"VIEW_AMP" : @(m->amp ? 1 : 0),
+      @"LAYER_OUT" : @(m->layer_out ? 1 : 0),
+   };
+   m.macros = [NSString stringWithFormat:@"WG=%u TOPO_LINE=%d SHAPE_VERT=%d PERPRIM=%d VIEWS=%u TASK=%d VIEW_AMP=%d LAYER_OUT=%d",
+                                         c.wg, c.line, c.vert, c.perprim, c.views, c.task, m->amp, m->layer_out];
+   MTLCompileOptions *opts = [MTLCompileOptions new];
+   opts.preprocessorMacros = macros;
+   NSError *e = nil;
+   id<MTLLibrary> lib = [g_dev newLibraryWithSource:[NSString stringWithUTF8String:gb_msl_mesh_source]
+                                            options:opts
+                                              error:&e];
+   if (!lib) {
+      gb_log("mesh.metal (%s): %s", m.macros.UTF8String, e.localizedDescription.UTF8String);
+      snprintf(err, n, "error: mesh.metal compile failed: %s", e.localizedDescription.UTF8String);
+      return nil;
+   }
+
+   if (@available(macOS 13.0, *)) {
+      MTLMeshRenderPipelineDescriptor *d = [MTLMeshRenderPipelineDescriptor new];
+      if (c.task) {
+         d.objectFunction = [lib newFunctionWithName:@"mesh_object"];
+         d.maxTotalThreadsPerObjectThreadgroup = GB_MESH_FANOUT;
+         d.maxTotalThreadgroupsPerMeshGrid = GB_MESH_FANOUT;
+         d.payloadMemoryLength = 0; /* the declared Payload (4 bytes) */
+      }
+      d.meshFunction = [lib newFunctionWithName:@"mesh_main"];
+      d.fragmentFunction = [lib newFunctionWithName:@"mesh_frag"];
+      if (!d.meshFunction || !d.fragmentFunction || (c.task && !d.objectFunction)) {
+         snprintf(err, n, "error: mesh.metal is missing mesh_main/mesh_frag/mesh_object");
+         return nil;
+      }
+      d.maxTotalThreadsPerMeshThreadgroup = c.wg;
+      d.colorAttachments[0].pixelFormat = MTLPixelFormatRGBA8Unorm;
+      if (m->amp)
+         d.maxVertexAmplificationCount = c.views;
+      m.desc = d;
+      m.ps = [g_dev newRenderPipelineStateWithMeshDescriptor:d options:MTLPipelineOptionNone reflection:nil error:&e];
+      if (!m.ps) {
+         gb_log("mesh pipeline (%s): %s", m.macros.UTF8String, e.localizedDescription.UTF8String);
+         snprintf(err, n, "error: mesh pipeline failed: %s", e.localizedDescription.UTF8String);
+         return nil;
+      }
+      if (m.ps.maxTotalThreadsPerMeshThreadgroup < c.wg ||
+          (c.task && m.ps.maxTotalThreadsPerObjectThreadgroup < GB_MESH_FANOUT)) {
+         snprintf(err, n, "pipeline allows %lu mesh / %lu object threads per threadgroup",
+                  (unsigned long)m.ps.maxTotalThreadsPerMeshThreadgroup,
+                  (unsigned long)m.ps.maxTotalThreadsPerObjectThreadgroup);
+         return nil;
+      }
+   }
+   m->maps[0] = (MTLVertexAmplificationViewMapping){.viewportArrayIndexOffset = 0, .renderTargetArrayIndexOffset = 0};
+   m->maps[1] = (MTLVertexAmplificationViewMapping){.viewportArrayIndexOffset = 0, .renderTargetArrayIndexOffset = 1};
+
+   /* --check-each: a target, a readback buffer and a fence per ring slot. */
+   m->check_each = o->check_each;
+   m->ntargets = 1;
+   if (m->check_each && !o->child) {
+      const int *dl = o->ndepths ? o->depths : (const int[]){1, 4};
+      int nd = o->ndepths ? o->ndepths : 2;
+      for (int i = 0; i < nd; i++)
+         m->ntargets = dl[i] > m->ntargets ? dl[i] : m->ntargets;
+   }
+   m->used = calloc(m->ntargets, sizeof(bool));
+   NSMutableArray *ts = [NSMutableArray array], *rbs = [NSMutableArray array], *fs = [NSMutableArray array];
+   for (int i = 0; i < m->ntargets; i++) {
+      [ts addObject:mesh_mtl_target(&c)];
+      if (m->check_each) {
+         [rbs addObject:buf((size_t)c.res * c.res * 4 * c.views, true)];
+         [fs addObject:[g_dev newFence]];
+      }
+   }
+   m.targets = ts;
+   m.rbs = rbs;
+   m.fences = fs;
+   if (o->check || o->check_each)
+      gb_mesh_ver_init(&m->ver, &c);
+   return m;
+}
+
+static void
+mesh_mtl_encode(id state, id<MTLCommandBuffer> cb, uint64_t k, int slot)
+{
+   GBMesh *m = state;
+   const struct gb_mesh_cfg *c = &m->c;
+   const int ti = m->check_each ? slot % m->ntargets : 0;
+   m->used[ti] = true;
+   id<MTLTexture> t = m.targets[ti];
+   MTLRenderPassDescriptor *rp = [MTLRenderPassDescriptor renderPassDescriptor];
+   rp.colorAttachments[0].texture = t;
+   rp.colorAttachments[0].loadAction = MTLLoadActionClear;
+   rp.colorAttachments[0].storeAction = MTLStoreActionStore;
+   rp.colorAttachments[0].clearColor = MTLClearColorMake(0, 0, 0, 0); /* exact in RGBA8: the check's "missing" colour */
+   if (c->views > 1)
+      rp.renderTargetArrayLength = c->views;
+   id<MTLRenderCommandEncoder> e = [cb renderCommandEncoderWithDescriptor:rp];
+   [e setRenderPipelineState:m.ps];
+   uint32_t pc[4] = {c->tiles_x, c->tiles_total, c->res, c->res * c->res};
+   NSUInteger groups = c->task ? c->groups / GB_MESH_FANOUT : c->groups;
+   if (@available(macOS 13.0, *)) {
+      [e setMeshBytes:pc length:sizeof(pc) atIndex:0];
+      if (c->views > 1 && !m->amp) {
+         uint32_t g = c->groups;
+         [e setMeshBytes:&g length:sizeof(g) atIndex:1];
+         groups *= c->views;
+      }
+      if (m->amp)
+         [e setVertexAmplificationCount:c->views viewMappings:m->maps];
+      [e drawMeshThreadgroups:MTLSizeMake(groups, 1, 1)
+          threadsPerObjectThreadgroup:MTLSizeMake(c->task ? GB_MESH_FANOUT : 1, 1, 1)
+            threadsPerMeshThreadgroup:MTLSizeMake(c->wg, 1, 1)];
+   }
+   if (m->check_each)
+      [e updateFence:m.fences[ti] afterStages:MTLRenderStageFragment];
+   [e endEncoding];
+   if (m->check_each) {
+      /* untracked resources: order the copy after the pass explicitly */
+      id<MTLBlitCommandEncoder> b = [cb blitCommandEncoder];
+      [b waitForFence:m.fences[ti]];
+      mesh_mtl_copy_out(b, c, t, m.rbs[ti]);
+      [b endEncoding];
+   }
+}
+
+static void
+mesh_mtl_done(id state, uint64_t k, int slot)
+{
+   GBMesh *m = state;
+   if (!m->check_each)
+      return;
+   id<MTLBuffer> b = m.rbs[slot % m->ntargets];
+   gb_mesh_verify(&m->ver, b.contents, 0, &m->last);
+   m->have_last = true;
+   gb_mesh_each_add(&m->each, &m->last);
+}
+
+static void
+mesh_mtl_each_reset(id state)
+{
+   GBMesh *m = state;
+   memset(&m->each, 0, sizeof(m->each));
+   memset(m->used, 0, m->ntargets * sizeof(bool));
+   m->have_last = false;
+}
+
+static void
+mesh_mtl_each_totals(id state, struct gb_check *out)
+{
+   GBMesh *m = state;
+   *out = m->each;
+   if (!out->checked)
+      snprintf(out->note, sizeof(out->note), "no submission was checked");
+}
+
+static void
+mesh_mtl_ilog_extra(id state, struct gb_json *j)
+{
+   GBMesh *m = state;
+   if (!m->check_each || !m->have_last)
+      return;
+   gb_json_int(j, "check_bad", (int64_t)m->last.bad);
+   gb_json_int(j, "check_missing_blocks", (int64_t)m->last.missing_blocks);
+   gb_json_int(j, "check_wrong_view", (int64_t)m->last.wrong_view);
+   gb_json_bool(j, "check_pass", m->last.pass);
+}
+
+static void
+mesh_mtl_check(id state, struct gb_check *out)
+{
+   GBMesh *m = state;
+   const struct gb_mesh_cfg *c = &m->c;
+   memset(out, 0, sizeof(*out));
+   if (!c->line) {
+      snprintf(out->note, sizeof(out->note), "--check supports topo=line only");
+      return;
+   }
+   id<MTLBuffer> b = buf((size_t)c->res * c->res * 4 * c->views, true);
+   id<MTLCommandQueue> q = [g_dev newCommandQueue];
+   struct gb_check sum = {0};
+   for (int i = 0; i < m->ntargets; i++) {
+      if (!m->used[i])
+         continue;
+      @autoreleasepool {
+         id<MTLCommandBuffer> cb = [q commandBuffer];
+         id<MTLBlitCommandEncoder> e = [cb blitCommandEncoder];
+         mesh_mtl_copy_out(e, c, m.targets[i], b);
+         [e endEncoding];
+         [cb commit];
+         [cb waitUntilCompleted];
+      }
+      struct gb_check one;
+      gb_mesh_verify(&m->ver, b.contents, 4, &one);
+      gb_check_add(&sum, &one);
+   }
+   *out = sum;
+}
+
+static void
+mesh_mtl_derive(const struct gb_opts *o, struct gb_result *r, const struct gb_samples *us)
+{
+   struct gb_mesh_cfg c;
+   if (gb_mesh_parse(o, &c))
+      return;
+   /* primitives rasterized per draw, all views */
+   gb_derive_rate(r, "mprim_s", "Mprim/s", us, gb_mesh_prims(&c));
+}
+
+/* An NSUInteger/BOOL property by name, or -1 when this OS does not have it
+ * (no compile-time dependency on the SDK declaring it). */
+static long
+kvc_num(id obj, NSString *key)
+{
+   if (!obj || ![obj respondsToSelector:NSSelectorFromString(key)])
+      return -1;
+   @try {
+      id v = [obj valueForKey:key];
+      return [v isKindOfClass:[NSNumber class]] ? [v longValue] : -1;
+   } @catch (NSException *x) {
+      return -1;
+   }
+}
+
+static void
+json_kvc(struct gb_json *j, id obj, NSString *key)
+{
+   long v = kvc_num(obj, key);
+   if (v >= 0)
+      gb_json_int(j, key.UTF8String, v);
+   else
+      gb_json_null(j, key.UTF8String);
+}
+
+/* Bindings from a reflection pipeline built only for this report. */
+static void
+json_bindings(struct gb_json *j, id refl, NSString *key)
+{
+   gb_json_arr_begin(j, key.UTF8String);
+   @try {
+      if (refl && [refl respondsToSelector:NSSelectorFromString(key)]) {
+         for (id b in (NSArray *)[refl valueForKey:key]) {
+            gb_json_obj_begin(j, NULL);
+            id name = [b respondsToSelector:@selector(name)] ? [b valueForKey:@"name"] : nil;
+            gb_json_str(j, "name", [name isKindOfClass:[NSString class]] ? [name UTF8String] : NULL);
+            gb_json_int(j, "index", kvc_num(b, @"index"));
+            gb_json_int(j, "type", kvc_num(b, @"type"));
+            gb_json_int(j, "used", kvc_num(b, @"isUsed"));
+            gb_json_obj_end(j);
+         }
+      }
+   } @catch (NSException *x) {
+   }
+   gb_json_arr_end(j);
+}
+
+static char *
+mesh_mtl_row_info(id state)
+{
+   GBMesh *m = state;
+   const struct gb_mesh_cfg *c = &m->c;
+   struct gb_json j;
+   gb_json_init(&j);
+   gb_json_obj_begin(&j, NULL);
+   gb_json_obj_begin(&j, "shaders");
+   gb_json_str(&j, "task", c->task ? "mesh_object" : NULL);
+   gb_json_str(&j, "mesh", "mesh_main");
+   gb_json_str(&j, "fragment", "mesh_frag");
+   gb_json_str(&j, "macros", m.macros.UTF8String);
+   gb_json_obj_end(&j);
+   gb_mesh_json_workload(&j, c, c->views < 2 ? "none" : m->amp ? "amplification" : "layer");
+   gb_json_bool(&j, "primitive_layer_output", m->layer_out);
+   gb_json_obj_begin(&j, "limits");
+   id ps = m.ps;
+   json_kvc(&j, ps, @"maxTotalThreadsPerObjectThreadgroup");
+   json_kvc(&j, ps, @"maxTotalThreadsPerMeshThreadgroup");
+   json_kvc(&j, ps, @"objectThreadExecutionWidth");
+   json_kvc(&j, ps, @"meshThreadExecutionWidth");
+   json_kvc(&j, ps, @"maxTotalThreadgroupsPerMeshGrid");
+   json_kvc(&j, ps, @"threadgroupSizeMatchesTileSize");
+   json_kvc(&j, ps, @"supportIndirectCommandBuffers");
+   if (@available(macOS 13.0, *)) {
+      MTLMeshRenderPipelineDescriptor *d = m.desc;
+      gb_json_int(&j, "desc_payloadMemoryLength", (int64_t)d.payloadMemoryLength);
+      gb_json_int(&j, "desc_maxTotalThreadsPerObjectThreadgroup", (int64_t)d.maxTotalThreadsPerObjectThreadgroup);
+      gb_json_int(&j, "desc_maxTotalThreadsPerMeshThreadgroup", (int64_t)d.maxTotalThreadsPerMeshThreadgroup);
+      gb_json_int(&j, "desc_maxTotalThreadgroupsPerMeshGrid", (int64_t)d.maxTotalThreadgroupsPerMeshGrid);
+      gb_json_int(&j, "desc_maxVertexAmplificationCount", (int64_t)d.maxVertexAmplificationCount);
+   }
+   gb_json_int(&j, "device_maxThreadgroupMemoryLength", (int64_t)g_dev.maxThreadgroupMemoryLength);
+   gb_json_bool(&j, "device_supportsVertexAmplificationCount2", [g_dev supportsVertexAmplificationCount:2]);
+   gb_json_obj_end(&j);
+   /* Bindings: a second pipeline with reflection, so the measured one is
+    * created exactly as without the report. */
+   gb_json_obj_begin(&j, "bindings");
+   if (@available(macOS 13.0, *)) {
+      @try {
+         MTLAutoreleasedRenderPipelineReflection refl = nil;
+         NSError *e = nil;
+         id<MTLRenderPipelineState> rps =
+            [g_dev newRenderPipelineStateWithMeshDescriptor:m.desc
+                                                    options:MTLPipelineOptionBindingInfo | MTLPipelineOptionBufferTypeInfo
+                                                 reflection:&refl
+                                                      error:&e];
+         if (rps) {
+            json_bindings(&j, refl, @"objectBindings");
+            json_bindings(&j, refl, @"meshBindings");
+            json_bindings(&j, refl, @"fragmentBindings");
+         }
+      } @catch (NSException *x) {
+      }
+   }
+   gb_json_obj_end(&j);
+   gb_json_obj_end(&j);
+   return j.buf; /* caller frees */
+}
+
+static const struct mtest t_render_mesh = {
+   .name = "render.mesh",
+   .known = gb_mesh_params,
+   .depths = {1, 4},
+   .nd = 2,
+   .setup = mesh_mtl_setup,
+   .encode_slot = mesh_mtl_encode,
+   .done_slot = mesh_mtl_done,
+   .derive = mesh_mtl_derive,
+   .check = mesh_mtl_check,
+   .check_each_totals = mesh_mtl_each_totals,
+   .check_each_reset = mesh_mtl_each_reset,
+   .ilog_extra = mesh_mtl_ilog_extra,
+   .probe_procs = true,
+   .row_info = mesh_mtl_row_info,
+};
+
 /* ---- copy.bw ---- */
 static void
 copy_derive(const struct gb_opts *o, struct gb_result *r, const struct gb_samples *us)
@@ -1788,6 +2234,7 @@ static int st_rh(const struct gb_opts *o) { return run_stream_test(o, &t_render_
 static int st_tvb(const struct gb_opts *o) { return run_stream_test(o, &t_render_tvb); }
 static int st_copy(const struct gb_opts *o) { return run_stream_test(o, &t_copy_bw); }
 static int st_diag_fill(const struct gb_opts *o) { return run_stream_test(o, &t_diag_fill); }
+static int st_mesh(const struct gb_opts *o) { return run_stream_test(o, &t_render_mesh); }
 static int st_mem_buffer(const struct gb_opts *o) { return run_mem(o, false); }
 static int st_mem_image(const struct gb_opts *o) { return run_mem(o, true); }
 
@@ -1801,6 +2248,7 @@ static const struct {
    {"render.light", st_rl},
    {"render.heavy", st_rh},
    {"render.tvb", st_tvb},
+   {"render.mesh", st_mesh},
    {"sync.signal", run_sync},
    {"mem.buffer", st_mem_buffer},
    {"mem.image", st_mem_image},

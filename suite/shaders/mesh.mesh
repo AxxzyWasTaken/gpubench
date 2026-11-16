@@ -1,0 +1,177 @@
+// SPDX-License-Identifier: GPL-2.0-only
+#version 460
+// render.mesh: the mesh shader. Variants are built with -D (suite/vk/CMakeLists.txt):
+//   WG        threads per mesh workgroup (32 or 128)
+//   TOPO_LINE 1: topo=line (coverage), 0: topo=tri
+//   SHAPE_VERT 1: shape=vert, 0: shape=prim (topo=tri only)
+//   PERPRIM   1: per-primitive colour + id outputs
+//   VIEWS     1, or 2: multiview, the colour depends on gl_ViewIndex
+//   TASK      1: the workgroup index comes from the task payload
+// Workloads (identical to mesh.metal, documented in suite/README.md):
+//   prim: V = WG vertices on a GW x GH grid of the workgroup's tile, P = 2*WG
+//         triangles; thread t writes vertex t and triangles 2t, 2t+1.
+//   vert: V = min(2*WG, 128) vertices, P = V/4 triangles, 4 extra vec4
+//         varyings per vertex; triangle p uses vertices 4p..4p+2 (three
+//         corners of its grid cell), vertex 4p+3 (the fourth corner) is
+//         written but not referenced. V is capped at 128 because Metal limits
+//         a metal::mesh to 16 KB (128 x 96 B per vertex = 12 KB).
+//   line: V = 2*WG, P = WG: thread t of workgroup g writes vertices t and
+//         t + WG and line t, a 1-pixel horizontal segment over pixel
+//         (g*WG + t) mod res^2.
+#extension GL_EXT_mesh_shader : require
+#if VIEWS > 1
+#extension GL_EXT_multiview : require
+#endif
+
+layout(local_size_x = WG, local_size_y = 1, local_size_z = 1) in;
+
+#define CELL 4u            // GB_MESH_CELL: pixels per grid cell
+#define GW (WG == 32 ? 8u : 16u)
+#define GH (uint(WG) / GW)
+
+#if TOPO_LINE
+#define NV (2 * WG)
+#define NP WG
+layout(lines, max_vertices = NV, max_primitives = NP) out;
+#elif SHAPE_VERT
+#if WG == 32
+#define NV 64
+#else
+#define NV 128
+#endif
+#define NP (NV / 4)
+layout(triangles, max_vertices = NV, max_primitives = NP) out;
+#else
+#define NV WG
+#define NP (2 * WG)
+layout(triangles, max_vertices = NV, max_primitives = NP) out;
+#endif
+
+layout(push_constant) uniform PC
+{
+   uint tiles_x;     // tiles per row
+   uint tiles_total; // tiles in the target
+   uint res;         // target width = height
+   uint npix;        // res * res
+} pc;
+
+#if TASK
+struct Payload { uint base; };
+taskPayloadSharedEXT Payload payload;
+#endif
+
+layout(location = 0) flat out vec4 v_color[];
+#if SHAPE_VERT && !TOPO_LINE
+layout(location = 1) out vec4 v_e0[];
+layout(location = 2) out vec4 v_e1[];
+layout(location = 3) out vec4 v_e2[];
+layout(location = 4) out vec4 v_e3[];
+#endif
+#if PERPRIM
+layout(location = 5) perprimitiveEXT flat out vec4 p_color[];
+layout(location = 6) perprimitiveEXT flat out uint p_id[];
+#endif
+
+// lowbias32 integer hash; colour bytes = h & 0xff, (h >> 8) & 0xff, (h >> 16) & 0xff, 255.
+uint gb_hash(uint x)
+{
+   x ^= x >> 16u;
+   x *= 0x7feb352du;
+   x ^= x >> 15u;
+   x *= 0x846ca68bu;
+   x ^= x >> 16u;
+   return x;
+}
+
+vec4 gb_color(uint g, uint view)
+{
+   uint h = gb_hash(g * 2u + view);
+   return vec4(float(h & 255u), float((h >> 8u) & 255u), float((h >> 16u) & 255u), 255.0) / 255.0;
+}
+
+// Pixel coordinates (origin top-left, y down) to clip space.
+vec4 gb_clip(vec2 px)
+{
+   return vec4(px * (2.0 / float(pc.res)) - 1.0, 0.0, 1.0);
+}
+
+void main()
+{
+   uint t = gl_LocalInvocationIndex;
+#if TASK
+   uint g = payload.base + gl_WorkGroupID.x;
+#else
+   uint g = gl_WorkGroupID.x;
+#endif
+#if VIEWS > 1
+   uint view = uint(gl_ViewIndex);
+#else
+   uint view = 0u;
+#endif
+   vec4 c = gb_color(g, view);
+   SetMeshOutputsEXT(NV, NP);
+
+#if TOPO_LINE
+   // A 1-pixel segment over pixel x of row y at the row's centre: from
+   // x + 1/64 to x + 1 + 1/64, so it holds exactly one pixel centre
+   // (rectangle rule) and leaves exactly one diamond (diamond-exit rule). The
+   // last column runs right to left (x + 1 - 1/64 to x - 1/64), so no segment
+   // reaches past the viewport and none is clipped.
+   uint i = (g * uint(WG) + t) % pc.npix;
+   uint xi = i % pc.res;
+   float x = float(xi), y = float(i / pc.res) + 0.5;
+   bool last = xi == pc.res - 1u;
+   float x0 = last ? x + 1.0 - 1.0 / 64.0 : x + 1.0 / 64.0;
+   float x1 = last ? x - 1.0 / 64.0 : x + 1.0 + 1.0 / 64.0;
+   gl_MeshVerticesEXT[t].gl_Position = gb_clip(vec2(x0, y));
+   gl_MeshVerticesEXT[t + uint(WG)].gl_Position = gb_clip(vec2(x1, y));
+   v_color[t] = c;
+   v_color[t + uint(WG)] = c;
+   gl_PrimitiveLineIndicesEXT[t] = uvec2(t, t + uint(WG));
+#if PERPRIM
+   p_color[t] = c;
+   p_id[t] = g * uint(NP) + t;
+#endif
+#else
+   uint tile = g % pc.tiles_total;
+   vec2 org = vec2(float((tile % pc.tiles_x) * GW * CELL), float((tile / pc.tiles_x) * GH * CELL));
+#if SHAPE_VERT
+   for (uint v = t; v < uint(NV); v += uint(WG)) {
+      uint cell = 2u * (v >> 2u), corner = v & 3u;
+      vec2 px = org + vec2(float(cell % GW + (corner & 1u)), float(cell / GW + (corner >> 1u))) * float(CELL);
+      gl_MeshVerticesEXT[v].gl_Position = gb_clip(px);
+      v_color[v] = c;
+      vec4 b = vec4(px, float(v), float(g & 1023u)) / 1024.0;
+      v_e0[v] = b;
+      v_e1[v] = b.yzwx + c;
+      v_e2[v] = b.zwxy * c;
+      v_e3[v] = b.wxyz - c;
+   }
+   if (t < uint(NP)) {
+      gl_PrimitiveTriangleIndicesEXT[t] = uvec3(4u * t, 4u * t + 1u, 4u * t + 2u);
+#if PERPRIM
+      p_color[t] = c;
+      p_id[t] = g * uint(NP) + t;
+#endif
+   }
+#else
+   uint gi = t % GW, gj = t / GW;
+   gl_MeshVerticesEXT[t].gl_Position = gb_clip(org + vec2(float(gi), float(gj)) * float(CELL));
+   v_color[t] = c;
+   // Thread t splits the grid quad whose top-left vertex it owns; threads on
+   // the last column or row split the neighbouring quad along its other
+   // diagonal, so all 2*WG triangles are small and non-degenerate.
+   uint qi = min(gi, GW - 2u), qj = min(gj, GH - 2u);
+   uint a = qj * GW + qi, b = a + 1u, d = a + GW, e = d + 1u;
+   bool alt = gi == GW - 1u || gj == GH - 1u;
+   gl_PrimitiveTriangleIndicesEXT[2u * t] = alt ? uvec3(a, b, d) : uvec3(a, b, e);
+   gl_PrimitiveTriangleIndicesEXT[2u * t + 1u] = alt ? uvec3(b, e, d) : uvec3(a, e, d);
+#if PERPRIM
+   p_color[2u * t] = c;
+   p_color[2u * t + 1u] = c;
+   p_id[2u * t] = g * uint(NP) + 2u * t;
+   p_id[2u * t + 1u] = g * uint(NP) + 2u * t + 1u;
+#endif
+#endif
+#endif
+}

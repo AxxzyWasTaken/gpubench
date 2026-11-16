@@ -10,6 +10,7 @@
 #include "shaders.h"
 #include "tests.h"
 #include "gb_params.h"
+#include "gb_mesh.h"
 
 static const VkFormat RT_FMT = VK_FORMAT_R8G8B8A8_UNORM;
 static const float CLEAR[4] = {0.1f, 0.2f, 0.3f, 1.0f};
@@ -420,6 +421,551 @@ static const struct gb_stream_test t_render_tvb = {
    .teardown = r_teardown,
    .record = r_record,
    .derive = tvb_derive,
+};
+
+/* ======================= render.mesh ======================= */
+/* Mesh shading (VK_EXT_mesh_shader): one vkCmdDrawMeshTasksEXT per submission
+ * into a res x res RGBA8 target (2 layers for views=2). Parameters and the
+ * exact geometry: suite/README.md "render.mesh". The Metal executor encodes the
+ * same draw with drawMeshThreadgroups. */
+
+static const float MESH_CLEAR[4] = {0.0f, 0.0f, 0.0f, 0.0f}; /* exact in RGBA8: the check's "missing" colour */
+
+struct mesh_state {
+   struct gb_mesh_cfg c;
+   struct gb_vk *vk;
+   struct gb_pipe p;
+   PFN_vkCmdDrawMeshTasksEXT draw;
+   int ntargets;               /* 1, or one per ring slot with --check-each */
+   struct gb_img *img;
+   struct gb_buf *rb;          /* --check-each: per-slot readback */
+   bool *used;                 /* targets rendered since the last reset */
+   bool check_each;
+   struct gb_mesh_ver ver;     /* --check, --check-each */
+   struct gb_check each, last;
+   bool have_last;
+   const char *task_name, *mesh_name, *frag_name;
+};
+
+/* Missing device support, or NULL. */
+static const char *
+mesh_limits(struct gb_vk *vk, const struct gb_mesh_cfg *c, char *buf, size_t n)
+{
+   const VkPhysicalDeviceMeshShaderPropertiesEXT *l = &vk->mesh_props;
+   if (!vk->mesh_ext)
+      return "VK_EXT_mesh_shader (meshShader) not supported";
+   if (c->task && !vk->mesh_feat.taskShader)
+      return "VK_EXT_mesh_shader taskShader not supported";
+   if (c->views > 1 && !vk->multiview)
+      return "multiview not supported";
+   if (c->views > 1 && !vk->mesh_feat.multiviewMeshShader)
+      return "VK_EXT_mesh_shader multiviewMeshShader not supported";
+#define LIM(cond, ...) do { if (!(cond)) { snprintf(buf, n, __VA_ARGS__); return buf; } } while (0)
+   LIM(c->views <= l->maxMeshMultiviewViewCount, "maxMeshMultiviewViewCount %u < %u", l->maxMeshMultiviewViewCount, c->views);
+   LIM(c->wg <= l->maxMeshWorkGroupInvocations && c->wg <= l->maxMeshWorkGroupSize[0],
+       "maxMeshWorkGroupInvocations %u / maxMeshWorkGroupSize[0] %u < wg %u", l->maxMeshWorkGroupInvocations,
+       l->maxMeshWorkGroupSize[0], c->wg);
+   LIM(c->nv <= l->maxMeshOutputVertices, "maxMeshOutputVertices %u < %u", l->maxMeshOutputVertices, c->nv);
+   LIM(c->np <= l->maxMeshOutputPrimitives, "maxMeshOutputPrimitives %u < %u", l->maxMeshOutputPrimitives, c->np);
+   uint32_t vcomp = 4 + (c->vert ? 16 : 0), pcomp = c->perprim ? 5 : 0;
+   LIM(vcomp + pcomp <= l->maxMeshOutputComponents, "maxMeshOutputComponents %u < %u", l->maxMeshOutputComponents,
+       vcomp + pcomp);
+   /* Output memory as VK_EXT_mesh_shader counts it: 16 bytes per location
+    * (gl_Position included) per vertex, per-primitive locations plus the
+    * index vector per primitive, each rounded to its granularity. */
+   uint32_t vg = l->meshOutputPerVertexGranularity ? l->meshOutputPerVertexGranularity : 1;
+   uint32_t pg = l->meshOutputPerPrimitiveGranularity ? l->meshOutputPerPrimitiveGranularity : 1;
+   uint64_t vbytes = 16u * (2 + (c->vert ? 4 : 0)), pbytes = 16u * (c->perprim ? 2 : 0) + 4u * (c->line ? 2 : 3);
+   uint64_t mem = (uint64_t)((c->nv + vg - 1) / vg * vg) * vbytes + (uint64_t)((c->np + pg - 1) / pg * pg) * pbytes;
+   LIM(mem <= l->maxMeshOutputMemorySize, "maxMeshOutputMemorySize %u < %llu", l->maxMeshOutputMemorySize,
+       (unsigned long long)mem);
+   if (c->task) {
+      uint32_t tg = c->groups / GB_MESH_FANOUT;
+      LIM(GB_MESH_FANOUT <= l->maxTaskWorkGroupInvocations && GB_MESH_FANOUT <= l->maxTaskWorkGroupSize[0],
+          "maxTaskWorkGroupInvocations %u < 32", l->maxTaskWorkGroupInvocations);
+      LIM(l->maxTaskPayloadSize >= 4, "maxTaskPayloadSize %u", l->maxTaskPayloadSize);
+      LIM(tg <= l->maxTaskWorkGroupCount[0] && tg <= l->maxTaskWorkGroupTotalCount,
+          "maxTaskWorkGroupCount[0] %u < %u", l->maxTaskWorkGroupCount[0], tg);
+      LIM(GB_MESH_FANOUT <= l->maxMeshWorkGroupCount[0], "maxMeshWorkGroupCount[0] %u < 32", l->maxMeshWorkGroupCount[0]);
+   } else {
+      LIM(c->groups <= l->maxMeshWorkGroupCount[0] && c->groups <= l->maxMeshWorkGroupTotalCount,
+          "maxMeshWorkGroupCount[0] %u < groups %u", l->maxMeshWorkGroupCount[0], c->groups);
+   }
+#undef LIM
+   return NULL;
+}
+
+static const struct gb_spv_entry *
+mesh_spv(const char *name)
+{
+   for (const struct gb_spv_entry *e = gb_mesh_spv; e->name; e++)
+      if (!strcmp(e->name, name))
+         return e;
+   return NULL;
+}
+
+static void
+mesh_layers_barrier(VkCommandBuffer cb, VkImage img, VkImageLayout from, VkImageLayout to,
+                    VkPipelineStageFlags2 ss, VkAccessFlags2 sa, VkPipelineStageFlags2 ds, VkAccessFlags2 da)
+{
+   VkImageMemoryBarrier2 b = {
+      .sType = VK_STRUCTURE_TYPE_IMAGE_MEMORY_BARRIER_2,
+      .srcStageMask = ss, .srcAccessMask = sa, .dstStageMask = ds, .dstAccessMask = da,
+      .oldLayout = from, .newLayout = to,
+      .srcQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED, .dstQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED,
+      .image = img,
+      .subresourceRange = {VK_IMAGE_ASPECT_COLOR_BIT, 0, 1, 0, VK_REMAINING_ARRAY_LAYERS},
+   };
+   VkDependencyInfo di = {.sType = VK_STRUCTURE_TYPE_DEPENDENCY_INFO, .imageMemoryBarrierCount = 1,
+                          .pImageMemoryBarriers = &b};
+   vkCmdPipelineBarrier2(cb, &di);
+}
+
+static void
+mesh_target(struct gb_vk *vk, const struct gb_mesh_cfg *c, struct gb_img *im)
+{
+   memset(im, 0, sizeof(*im));
+   im->w = im->h = c->res;
+   im->fmt = RT_FMT;
+   VkImageCreateInfo ci = {
+      .sType = VK_STRUCTURE_TYPE_IMAGE_CREATE_INFO,
+      .imageType = VK_IMAGE_TYPE_2D,
+      .format = RT_FMT,
+      .extent = {c->res, c->res, 1},
+      .mipLevels = 1,
+      .arrayLayers = c->views,
+      .samples = VK_SAMPLE_COUNT_1_BIT,
+      .tiling = VK_IMAGE_TILING_OPTIMAL,
+      /* TRANSFER_SRC always (also without --check), so checked and unchecked
+       * runs measure the same image. */
+      .usage = VK_IMAGE_USAGE_COLOR_ATTACHMENT_BIT | VK_IMAGE_USAGE_TRANSFER_SRC_BIT,
+      .initialLayout = VK_IMAGE_LAYOUT_UNDEFINED,
+   };
+   GB_VK_CHECK(vkCreateImage(vk->dev, &ci, NULL, &im->img));
+   VkMemoryRequirements req;
+   vkGetImageMemoryRequirements(vk->dev, im->img, &req);
+   uint32_t type = vk->mem_dev;
+   if (!(req.memoryTypeBits & (1u << type)))
+      for (type = 0; type < vk->memprops.memoryTypeCount && !(req.memoryTypeBits & (1u << type)); type++)
+         ;
+   VkMemoryAllocateInfo ai = {.sType = VK_STRUCTURE_TYPE_MEMORY_ALLOCATE_INFO, .allocationSize = req.size,
+                              .memoryTypeIndex = type};
+   GB_VK_CHECK(vkAllocateMemory(vk->dev, &ai, NULL, &im->mem));
+   GB_VK_CHECK(vkBindImageMemory(vk->dev, im->img, im->mem, 0));
+   VkImageViewCreateInfo vi = {
+      .sType = VK_STRUCTURE_TYPE_IMAGE_VIEW_CREATE_INFO,
+      .image = im->img,
+      .viewType = c->views > 1 ? VK_IMAGE_VIEW_TYPE_2D_ARRAY : VK_IMAGE_VIEW_TYPE_2D,
+      .format = RT_FMT,
+      .subresourceRange = {VK_IMAGE_ASPECT_COLOR_BIT, 0, 1, 0, c->views},
+   };
+   GB_VK_CHECK(vkCreateImageView(vk->dev, &vi, NULL, &im->view));
+   VkCommandBuffer cb = gb_oneshot_begin(vk);
+   mesh_layers_barrier(cb, im->img, VK_IMAGE_LAYOUT_UNDEFINED, VK_IMAGE_LAYOUT_COLOR_ATTACHMENT_OPTIMAL,
+                       VK_PIPELINE_STAGE_2_NONE, 0, VK_PIPELINE_STAGE_2_COLOR_ATTACHMENT_OUTPUT_BIT,
+                       VK_ACCESS_2_COLOR_ATTACHMENT_WRITE_BIT);
+   gb_oneshot_end(vk, cb);
+}
+
+static VkResult
+mesh_pipe(struct gb_vk *vk, const struct gb_mesh_cfg *c, const struct gb_spv_entry *const *mods, struct gb_pipe *p)
+{
+   memset(p, 0, sizeof(*p));
+   VkPushConstantRange pr = {VK_SHADER_STAGE_MESH_BIT_EXT, 0, 16};
+   VkPipelineLayoutCreateInfo lci = {
+      .sType = VK_STRUCTURE_TYPE_PIPELINE_LAYOUT_CREATE_INFO,
+      .pushConstantRangeCount = 1,
+      .pPushConstantRanges = &pr,
+   };
+   VkResult r = vkCreatePipelineLayout(vk->dev, &lci, NULL, &p->layout);
+   if (r != VK_SUCCESS)
+      return r;
+   p->push_stages = VK_SHADER_STAGE_MESH_BIT_EXT;
+   p->push_size = 16;
+   const VkShaderStageFlagBits stages[3] = {VK_SHADER_STAGE_TASK_BIT_EXT, VK_SHADER_STAGE_MESH_BIT_EXT,
+                                            VK_SHADER_STAGE_FRAGMENT_BIT};
+   VkPipelineShaderStageCreateInfo st[3];
+   VkShaderModule m[3] = {0};
+   uint32_t ns = 0;
+   for (int i = 0; i < 3; i++) {
+      if (!mods[i])
+         continue;
+      m[i] = gb_shader(vk, mods[i]->code, mods[i]->size);
+      st[ns++] = (VkPipelineShaderStageCreateInfo){.sType = VK_STRUCTURE_TYPE_PIPELINE_SHADER_STAGE_CREATE_INFO,
+                                                   .stage = stages[i], .module = m[i], .pName = "main"};
+   }
+   VkPipelineViewportStateCreateInfo vp = {.sType = VK_STRUCTURE_TYPE_PIPELINE_VIEWPORT_STATE_CREATE_INFO,
+                                           .viewportCount = 1, .scissorCount = 1};
+   VkPipelineRasterizationStateCreateInfo rs = {
+      .sType = VK_STRUCTURE_TYPE_PIPELINE_RASTERIZATION_STATE_CREATE_INFO,
+      .polygonMode = VK_POLYGON_MODE_FILL,
+      .cullMode = VK_CULL_MODE_NONE,
+      .frontFace = VK_FRONT_FACE_COUNTER_CLOCKWISE,
+      .lineWidth = 1.0f,
+   };
+   VkPipelineMultisampleStateCreateInfo ms = {.sType = VK_STRUCTURE_TYPE_PIPELINE_MULTISAMPLE_STATE_CREATE_INFO,
+                                              .rasterizationSamples = VK_SAMPLE_COUNT_1_BIT};
+   VkPipelineColorBlendAttachmentState ba = {.colorWriteMask = 0xf};
+   VkPipelineColorBlendStateCreateInfo cb = {.sType = VK_STRUCTURE_TYPE_PIPELINE_COLOR_BLEND_STATE_CREATE_INFO,
+                                             .attachmentCount = 1, .pAttachments = &ba};
+   VkDynamicState dyn[2] = {VK_DYNAMIC_STATE_VIEWPORT, VK_DYNAMIC_STATE_SCISSOR};
+   VkPipelineDynamicStateCreateInfo ds = {.sType = VK_STRUCTURE_TYPE_PIPELINE_DYNAMIC_STATE_CREATE_INFO,
+                                          .dynamicStateCount = 2, .pDynamicStates = dyn};
+   VkFormat fmt = RT_FMT;
+   VkPipelineRenderingCreateInfo ri = {
+      .sType = VK_STRUCTURE_TYPE_PIPELINE_RENDERING_CREATE_INFO,
+      .viewMask = c->views > 1 ? (1u << c->views) - 1 : 0,
+      .colorAttachmentCount = 1,
+      .pColorAttachmentFormats = &fmt,
+   };
+   VkGraphicsPipelineCreateInfo ci = {
+      .sType = VK_STRUCTURE_TYPE_GRAPHICS_PIPELINE_CREATE_INFO,
+      .pNext = &ri,
+      .flags = vk->exec_props ? VK_PIPELINE_CREATE_CAPTURE_STATISTICS_BIT_KHR : 0,
+      .stageCount = ns,
+      .pStages = st,
+      .pViewportState = &vp,
+      .pRasterizationState = &rs,
+      .pMultisampleState = &ms,
+      .pColorBlendState = &cb,
+      .pDynamicState = &ds,
+      .layout = p->layout,
+   };
+   r = vkCreateGraphicsPipelines(vk->dev, VK_NULL_HANDLE, 1, &ci, NULL, &p->pipe);
+   for (int i = 0; i < 3; i++)
+      if (m[i])
+         vkDestroyShaderModule(vk->dev, m[i], NULL);
+   return r;
+}
+
+static void mesh_teardown(struct gb_vk *vk, void *p);
+
+static void *
+mesh_setup(struct gb_vk *vk, const struct gb_opts *o, char *err, size_t n)
+{
+   struct gb_mesh_cfg c;
+   const char *why = gb_mesh_parse(o, &c);
+   if (!why)
+      why = mesh_limits(vk, &c, err, n);
+   if (why) {
+      if (why != err)
+         set_err(err, n, why);
+      return NULL;
+   }
+   char mname[64], fname[64];
+   snprintf(mname, sizeof(mname), "mesh_%s_w%u_p%d_v%u_%c_mesh", c.line ? "line" : c.vert ? "vert" : "prim", c.wg,
+            c.perprim, c.views, c.task ? 't' : 'm');
+   snprintf(fname, sizeof(fname), "mesh_frag_p%d_h%d_frag", c.perprim, c.vert);
+   const struct gb_spv_entry *mods[3] = {c.task ? mesh_spv("mesh_task_task") : NULL, mesh_spv(mname), mesh_spv(fname)};
+   if (!mods[1] || !mods[2] || (c.task && !mods[0])) {
+      snprintf(err, n, "no SPIR-V variant %s/%s", mname, fname);
+      return NULL;
+   }
+   struct mesh_state *st = calloc(1, sizeof(*st));
+   st->c = c;
+   st->vk = vk;
+   st->task_name = mods[0] ? mods[0]->name : NULL;
+   st->mesh_name = mods[1]->name;
+   st->frag_name = mods[2]->name;
+   st->draw = (PFN_vkCmdDrawMeshTasksEXT)vkGetDeviceProcAddr(vk->dev, "vkCmdDrawMeshTasksEXT");
+   VkResult r = st->draw ? mesh_pipe(vk, &c, mods, &st->p) : VK_ERROR_EXTENSION_NOT_PRESENT;
+   if (r != VK_SUCCESS) {
+      snprintf(err, n, "mesh pipeline creation failed: %d", (int)r);
+      gb_pipe_destroy(vk, &st->p);
+      free(st);
+      return NULL;
+   }
+   /* --check-each: a target and a readback buffer per ring slot, so every
+    * submission is checked against its own target. */
+   st->check_each = o->check_each;
+   st->ntargets = 1;
+   if (st->check_each && !o->child) {
+      const int *d = o->ndepths ? o->depths : (const int[]){1, 4};
+      int nd = o->ndepths ? o->ndepths : 2;
+      for (int i = 0; i < nd; i++)
+         st->ntargets = d[i] > st->ntargets ? d[i] : st->ntargets;
+   }
+   st->img = calloc(st->ntargets, sizeof(*st->img));
+   st->used = calloc(st->ntargets, sizeof(*st->used));
+   for (int i = 0; i < st->ntargets; i++)
+      mesh_target(vk, &c, &st->img[i]);
+   if (o->check || o->check_each)
+      gb_mesh_ver_init(&st->ver, &c);
+   if (st->check_each) {
+      st->rb = calloc(st->ntargets, sizeof(*st->rb));
+      for (int i = 0; i < st->ntargets; i++)
+         gb_buf_create(vk, (VkDeviceSize)c.res * c.res * 4 * c.views, VK_BUFFER_USAGE_TRANSFER_DST_BIT, true,
+                       &st->rb[i]);
+   }
+   return st;
+}
+
+static void
+mesh_teardown(struct gb_vk *vk, void *p)
+{
+   struct mesh_state *st = p;
+   gb_pipe_destroy(vk, &st->p);
+   for (int i = 0; i < st->ntargets; i++) {
+      gb_img_destroy(vk, &st->img[i]);
+      if (st->rb)
+         gb_buf_destroy(vk, &st->rb[i]);
+   }
+   free(st->img);
+   free(st->used);
+   free(st->rb);
+   gb_mesh_ver_free(&st->ver);
+   free(st);
+}
+
+static void
+mesh_copy_out(VkCommandBuffer cb, const struct gb_mesh_cfg *c, const struct gb_img *im, const struct gb_buf *b)
+{
+   mesh_layers_barrier(cb, im->img, VK_IMAGE_LAYOUT_COLOR_ATTACHMENT_OPTIMAL, VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL,
+                       VK_PIPELINE_STAGE_2_COLOR_ATTACHMENT_OUTPUT_BIT, VK_ACCESS_2_COLOR_ATTACHMENT_WRITE_BIT,
+                       VK_PIPELINE_STAGE_2_COPY_BIT, VK_ACCESS_2_TRANSFER_READ_BIT);
+   VkBufferImageCopy region = {
+      .imageSubresource = {VK_IMAGE_ASPECT_COLOR_BIT, 0, 0, c->views},
+      .imageExtent = {c->res, c->res, 1},
+   };
+   vkCmdCopyImageToBuffer(cb, im->img, VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL, b->buf, 1, &region);
+   mesh_layers_barrier(cb, im->img, VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL, VK_IMAGE_LAYOUT_COLOR_ATTACHMENT_OPTIMAL,
+                       VK_PIPELINE_STAGE_2_COPY_BIT, 0, VK_PIPELINE_STAGE_2_COLOR_ATTACHMENT_OUTPUT_BIT,
+                       VK_ACCESS_2_COLOR_ATTACHMENT_WRITE_BIT);
+   VkBufferMemoryBarrier2 hb = {
+      .sType = VK_STRUCTURE_TYPE_BUFFER_MEMORY_BARRIER_2,
+      .srcStageMask = VK_PIPELINE_STAGE_2_COPY_BIT, .srcAccessMask = VK_ACCESS_2_TRANSFER_WRITE_BIT,
+      .dstStageMask = VK_PIPELINE_STAGE_2_HOST_BIT, .dstAccessMask = VK_ACCESS_2_HOST_READ_BIT,
+      .srcQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED, .dstQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED,
+      .buffer = b->buf, .size = VK_WHOLE_SIZE,
+   };
+   VkDependencyInfo di = {.sType = VK_STRUCTURE_TYPE_DEPENDENCY_INFO, .bufferMemoryBarrierCount = 1,
+                          .pBufferMemoryBarriers = &hb};
+   vkCmdPipelineBarrier2(cb, &di);
+}
+
+static void
+mesh_record_slot(void *p, VkCommandBuffer cb, uint64_t k, int slot)
+{
+   (void)k;
+   struct mesh_state *st = p;
+   const struct gb_mesh_cfg *c = &st->c;
+   const int ti = st->check_each ? slot % st->ntargets : 0;
+   const struct gb_img *im = &st->img[ti];
+   st->used[ti] = true;
+   VkRenderingAttachmentInfo ca = {
+      .sType = VK_STRUCTURE_TYPE_RENDERING_ATTACHMENT_INFO,
+      .imageView = im->view,
+      .imageLayout = VK_IMAGE_LAYOUT_COLOR_ATTACHMENT_OPTIMAL,
+      .loadOp = VK_ATTACHMENT_LOAD_OP_CLEAR,
+      .storeOp = VK_ATTACHMENT_STORE_OP_STORE,
+      .clearValue.color.float32 = {MESH_CLEAR[0], MESH_CLEAR[1], MESH_CLEAR[2], MESH_CLEAR[3]},
+   };
+   VkRenderingInfo ri = {
+      .sType = VK_STRUCTURE_TYPE_RENDERING_INFO,
+      .renderArea = {{0, 0}, {c->res, c->res}},
+      .layerCount = 1,
+      .viewMask = c->views > 1 ? (1u << c->views) - 1 : 0,
+      .colorAttachmentCount = 1,
+      .pColorAttachments = &ca,
+   };
+   vkCmdBeginRendering(cb, &ri);
+   VkViewport v = {0, 0, (float)c->res, (float)c->res, 0, 1};
+   VkRect2D s = {{0, 0}, {c->res, c->res}};
+   vkCmdSetViewport(cb, 0, 1, &v);
+   vkCmdSetScissor(cb, 0, 1, &s);
+   vkCmdBindPipeline(cb, VK_PIPELINE_BIND_POINT_GRAPHICS, st->p.pipe);
+   uint32_t pc[4] = {c->tiles_x, c->tiles_total, c->res, c->res * c->res};
+   vkCmdPushConstants(cb, st->p.layout, VK_SHADER_STAGE_MESH_BIT_EXT, 0, sizeof(pc), pc);
+   st->draw(cb, c->task ? c->groups / GB_MESH_FANOUT : c->groups, 1, 1);
+   vkCmdEndRendering(cb);
+   if (st->check_each)
+      mesh_copy_out(cb, c, im, &st->rb[ti]);
+}
+
+static void
+mesh_done(void *p, uint64_t k, int slot)
+{
+   (void)k;
+   struct mesh_state *st = p;
+   if (!st->check_each)
+      return;
+   gb_mesh_verify(&st->ver, st->rb[slot % st->ntargets].map, 0, &st->last);
+   st->have_last = true;
+   gb_mesh_each_add(&st->each, &st->last);
+}
+
+static void
+mesh_each_reset(void *p)
+{
+   struct mesh_state *st = p;
+   memset(&st->each, 0, sizeof(st->each));
+   memset(st->used, 0, st->ntargets * sizeof(*st->used));
+   st->have_last = false;
+}
+
+static void
+mesh_each_totals(void *p, struct gb_check *out)
+{
+   struct mesh_state *st = p;
+   *out = st->each;
+   if (!out->checked)
+      snprintf(out->note, sizeof(out->note), "no submission was checked");
+}
+
+static void
+mesh_ilog_extra(void *p, struct gb_json *j)
+{
+   struct mesh_state *st = p;
+   if (!st->check_each || !st->have_last)
+      return;
+   gb_json_int(j, "check_bad", (int64_t)st->last.bad);
+   gb_json_int(j, "check_missing_blocks", (int64_t)st->last.missing_blocks);
+   gb_json_int(j, "check_wrong_view", (int64_t)st->last.wrong_view);
+   gb_json_bool(j, "check_pass", st->last.pass);
+}
+
+static void
+mesh_check(struct gb_vk *vk, void *p, struct gb_check *out)
+{
+   struct mesh_state *st = p;
+   const struct gb_mesh_cfg *c = &st->c;
+   memset(out, 0, sizeof(*out));
+   if (!c->line) {
+      snprintf(out->note, sizeof(out->note), "--check supports topo=line only");
+      return;
+   }
+   struct gb_buf b;
+   gb_buf_create(vk, (VkDeviceSize)c->res * c->res * 4 * c->views, VK_BUFFER_USAGE_TRANSFER_DST_BIT, true, &b);
+   struct gb_check sum = {0};
+   for (int i = 0; i < st->ntargets; i++) {
+      if (!st->used[i])
+         continue;
+      VkCommandBuffer cb = gb_oneshot_begin(vk);
+      mesh_copy_out(cb, c, &st->img[i], &b);
+      gb_oneshot_end(vk, cb);
+      struct gb_check one;
+      gb_mesh_verify(&st->ver, b.map, 4, &one);
+      gb_check_add(&sum, &one);
+   }
+   gb_buf_destroy(vk, &b);
+   *out = sum;
+}
+
+static void
+mesh_derive(const struct gb_opts *o, struct gb_result *r, const struct gb_samples *us)
+{
+   struct gb_mesh_cfg c;
+   if (gb_mesh_parse(o, &c))
+      return;
+   /* primitives rasterized per draw, all views */
+   gb_derive_rate(r, "mprim_s", "Mprim/s", us, gb_mesh_prims(&c));
+}
+
+/* Pipeline-executable statistics as {"<stage name>": {stat: value}}. */
+static void
+json_exec_stats(struct gb_vk *vk, VkPipeline pipe, struct gb_json *j)
+{
+   PFN_vkGetPipelineExecutablePropertiesKHR gp =
+      (PFN_vkGetPipelineExecutablePropertiesKHR)vkGetDeviceProcAddr(vk->dev, "vkGetPipelineExecutablePropertiesKHR");
+   PFN_vkGetPipelineExecutableStatisticsKHR gs =
+      (PFN_vkGetPipelineExecutableStatisticsKHR)vkGetDeviceProcAddr(vk->dev, "vkGetPipelineExecutableStatisticsKHR");
+   if (!gp || !gs)
+      return;
+   VkPipelineInfoKHR pi = {.sType = VK_STRUCTURE_TYPE_PIPELINE_INFO_KHR, .pipeline = pipe};
+   uint32_t n = 0;
+   gp(vk->dev, &pi, &n, NULL);
+   VkPipelineExecutablePropertiesKHR props[8];
+   if (n > 8)
+      n = 8;
+   for (uint32_t i = 0; i < n; i++)
+      props[i] = (VkPipelineExecutablePropertiesKHR){.sType = VK_STRUCTURE_TYPE_PIPELINE_EXECUTABLE_PROPERTIES_KHR};
+   gp(vk->dev, &pi, &n, props);
+   gb_json_obj_begin(j, "stats");
+   for (uint32_t e = 0; e < n; e++) {
+      VkPipelineExecutableInfoKHR ei = {.sType = VK_STRUCTURE_TYPE_PIPELINE_EXECUTABLE_INFO_KHR, .pipeline = pipe,
+                                        .executableIndex = e};
+      uint32_t ns = 0;
+      gs(vk->dev, &ei, &ns, NULL);
+      VkPipelineExecutableStatisticKHR *sv = calloc(ns ? ns : 1, sizeof(*sv));
+      for (uint32_t i = 0; i < ns; i++)
+         sv[i].sType = VK_STRUCTURE_TYPE_PIPELINE_EXECUTABLE_STATISTIC_KHR;
+      gs(vk->dev, &ei, &ns, sv);
+      gb_json_obj_begin(j, props[e].name);
+      for (uint32_t i = 0; i < ns; i++) {
+         switch (sv[i].format) {
+         case VK_PIPELINE_EXECUTABLE_STATISTIC_FORMAT_BOOL32_KHR: gb_json_bool(j, sv[i].name, sv[i].value.b32); break;
+         case VK_PIPELINE_EXECUTABLE_STATISTIC_FORMAT_INT64_KHR: gb_json_int(j, sv[i].name, sv[i].value.i64); break;
+         case VK_PIPELINE_EXECUTABLE_STATISTIC_FORMAT_UINT64_KHR:
+            gb_json_int(j, sv[i].name, (int64_t)sv[i].value.u64);
+            break;
+         case VK_PIPELINE_EXECUTABLE_STATISTIC_FORMAT_FLOAT64_KHR: gb_json_num(j, sv[i].name, sv[i].value.f64); break;
+         default: break;
+         }
+      }
+      gb_json_obj_end(j);
+      free(sv);
+   }
+   gb_json_obj_end(j);
+}
+
+static char *
+mesh_row_info(struct gb_vk *vk, void *p)
+{
+   struct mesh_state *st = p;
+   const struct gb_mesh_cfg *c = &st->c;
+   const VkPhysicalDeviceMeshShaderPropertiesEXT *l = &vk->mesh_props;
+   struct gb_json j;
+   gb_json_init(&j);
+   gb_json_obj_begin(&j, NULL);
+   gb_json_obj_begin(&j, "shaders");
+   gb_json_str(&j, "task", st->task_name);
+   gb_json_str(&j, "mesh", st->mesh_name);
+   gb_json_str(&j, "fragment", st->frag_name);
+   gb_json_obj_end(&j);
+   gb_mesh_json_workload(&j, c, c->views > 1 ? "viewMask" : "none");
+   gb_json_obj_begin(&j, "limits");
+   gb_json_int(&j, "maxMeshWorkGroupInvocations", l->maxMeshWorkGroupInvocations);
+   gb_json_int(&j, "maxMeshWorkGroupCount0", l->maxMeshWorkGroupCount[0]);
+   gb_json_int(&j, "maxMeshWorkGroupTotalCount", l->maxMeshWorkGroupTotalCount);
+   gb_json_int(&j, "maxMeshOutputVertices", l->maxMeshOutputVertices);
+   gb_json_int(&j, "maxMeshOutputPrimitives", l->maxMeshOutputPrimitives);
+   gb_json_int(&j, "maxMeshOutputComponents", l->maxMeshOutputComponents);
+   gb_json_int(&j, "maxMeshOutputMemorySize", l->maxMeshOutputMemorySize);
+   gb_json_int(&j, "maxMeshSharedMemorySize", l->maxMeshSharedMemorySize);
+   gb_json_int(&j, "maxMeshMultiviewViewCount", l->maxMeshMultiviewViewCount);
+   gb_json_int(&j, "maxPreferredMeshWorkGroupInvocations", l->maxPreferredMeshWorkGroupInvocations);
+   gb_json_int(&j, "maxTaskWorkGroupInvocations", l->maxTaskWorkGroupInvocations);
+   gb_json_int(&j, "maxTaskWorkGroupCount0", l->maxTaskWorkGroupCount[0]);
+   gb_json_int(&j, "maxTaskPayloadSize", l->maxTaskPayloadSize);
+   gb_json_int(&j, "maxPreferredTaskWorkGroupInvocations", l->maxPreferredTaskWorkGroupInvocations);
+   gb_json_int(&j, "meshOutputPerVertexGranularity", l->meshOutputPerVertexGranularity);
+   gb_json_int(&j, "meshOutputPerPrimitiveGranularity", l->meshOutputPerPrimitiveGranularity);
+   gb_json_bool(&j, "prefersLocalInvocationVertexOutput", l->prefersLocalInvocationVertexOutput);
+   gb_json_bool(&j, "prefersLocalInvocationPrimitiveOutput", l->prefersLocalInvocationPrimitiveOutput);
+   gb_json_bool(&j, "prefersCompactVertexOutput", l->prefersCompactVertexOutput);
+   gb_json_bool(&j, "prefersCompactPrimitiveOutput", l->prefersCompactPrimitiveOutput);
+   gb_json_obj_end(&j);
+   if (vk->exec_props)
+      json_exec_stats(vk, st->p.pipe, &j);
+   gb_json_obj_end(&j);
+   return j.buf; /* caller frees */
+}
+
+static const struct gb_stream_test t_render_mesh = {
+   .name = "render.mesh",
+   .known_params = gb_mesh_params,
+   .default_depths = {1, 4}, .ndefault = 2,
+   .setup = mesh_setup,
+   .teardown = mesh_teardown,
+   .record_slot = mesh_record_slot,
+   .done = mesh_done,
+   .derive = mesh_derive,
+   .check = mesh_check,
+   .check_each_totals = mesh_each_totals,
+   .check_each_reset = mesh_each_reset,
+   .ilog_extra = mesh_ilog_extra,
+   .probe_procs = true,
+   .row_info = mesh_row_info,
 };
 
 /* ======================= copy.bw ======================= */
@@ -1350,6 +1896,12 @@ static int st_render_heavy(const struct gb_opts *o) { return gb_run_stream_test(
 static int st_render_tvb(const struct gb_opts *o) { return gb_run_stream_test(o, &t_render_tvb); }
 static int st_copy_bw(const struct gb_opts *o) { return gb_run_stream_test(o, &t_copy_bw); }
 static int st_diag_fill(const struct gb_opts *o) { return gb_run_stream_test(o, &t_diag_fill); }
+static int
+st_render_mesh(const struct gb_opts *o)
+{
+   gb_vk_want_mesh_shader = true;
+   return gb_run_stream_test(o, &t_render_mesh);
+}
 
 const struct gb_test gb_tests[] = {
    {"submit.empty", st_submit_empty},
@@ -1358,6 +1910,7 @@ const struct gb_test gb_tests[] = {
    {"render.light", st_render_light},
    {"render.heavy", st_render_heavy},
    {"render.tvb", st_render_tvb},
+   {"render.mesh", st_render_mesh},
    {"sync.signal", run_sync},
    {"mem.buffer", run_mem_buffer},
    {"mem.image", run_mem_image},

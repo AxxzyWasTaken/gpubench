@@ -47,6 +47,29 @@ mem      suite  mem.image       --param dim=256
 mem      suite  mem.image       --param dim=1024
 mem      suite  mem.image       --param dim=4096
 
+# Mesh shading (render.mesh; README "render.mesh"). The wg=128 rows draw a
+# quarter of the groups, so both workgroup sizes run the same threads and
+# shape=prim draws 262144 triangles in every row (views=2: per view).
+mesh     suite  render.mesh     --depths 1,4 --param stage=mesh --param wg=32 --param shape=prim --param groups=4096
+mesh     suite  render.mesh     --depths 1,4 --param stage=mesh --param wg=128 --param shape=prim --param groups=1024
+mesh     suite  render.mesh     --depths 1,4 --param stage=mesh --param wg=32 --param shape=vert --param groups=4096
+mesh     suite  render.mesh     --depths 1,4 --param stage=mesh --param wg=128 --param shape=vert --param groups=1024
+mesh     suite  render.mesh     --depths 1,4 --param stage=task --param wg=32 --param shape=prim --param groups=4096
+mesh     suite  render.mesh     --depths 1,4 --param stage=task --param wg=128 --param shape=prim --param groups=1024
+mesh     suite  render.mesh     --depths 1,4 --param stage=mesh --param wg=32 --param shape=prim --param perprim=1 --param groups=4096
+mesh     suite  render.mesh     --depths 1,4 --param stage=mesh --param wg=32 --param shape=prim --param views=2 --param groups=4096
+mesh     suite  render.mesh     --mode procs --depths 2 --param stage=mesh --param wg=32 --param shape=prim --param groups=4096
+# Coverage: two processes, one two-view 1024x1024 line draw each, checked.
+mesh     suite  render.mesh     --mode procs --depths 2 --check --param stage=mesh --param wg=32 --param topo=line --param groups=32768 --param res=1024 --param views=2
+#
+# Diagnostics, not rows (README "Diagnostics"; replace gpubench-vk with
+# bin/macos/gpubench-mtl on macOS). The traced coverage workload, every
+# command buffer checked and logged, 300 per process, logs in /tmp/mesh-il.jsonl.<pid>:
+#   gpubench-vk --test render.mesh --mode procs --depths 2 --param stage=mesh --param wg=32 --param topo=line --param groups=32768 --param res=1024 --param views=2 --check-each --interval-log /tmp/mesh-il.jsonl --count 300 --runs 1 --run-ms 0 --warmup-ms 500 --timestamps off
+# One render.mesh process and one render.heavy kind=geom process started
+# together (procs mode runs one test, so two executors from a shell):
+#   E=gpubench-vk; $E --test render.mesh --depths 1 --param stage=mesh --param wg=32 --param topo=line --param groups=32768 --param res=1024 --param views=2 --check-each --interval-log /tmp/mix-mesh.jsonl --count 300 --runs 1 --run-ms 0 --warmup-ms 500 --timestamps off > /tmp/mix-mesh.json & $E --test render.heavy --depths 1 --param kind=geom --param res=1080p --interval-log /tmp/mix-geom.jsonl --count 300 --runs 1 --run-ms 0 --warmup-ms 500 --timestamps off > /tmp/mix-geom.json & wait
+#
 # Tiler-memory overflow last: a fault here cannot cost the other chunks.
 tvb      suite  render.tvb      --depths 1,4 --param tris=8192
 tvb      suite  render.tvb      --depths 1,4 --param tris=32768

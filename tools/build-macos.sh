@@ -11,12 +11,20 @@ MIN=${GB_MACOS_MIN:-14.0}
 mkdir -p "$OUT"
 T=$(mktemp -d)
 trap 'rm -rf "$T"' EXIT
+# gb_msl_source: every suite shader but mesh.metal, built once at start-up.
+# gb_msl_mesh_source: mesh.metal alone, compiled per render.mesh
+# configuration with preprocessor macros, so it cannot break the other tests.
+msl() { sed -e 's/\\/\\\\/g' -e 's/"/\\"/g' -e 's/^/"/' -e 's/$/\\n"/' "$1"; }
 {
   echo '/* Generated from the suite shader sources. */'
   echo 'static const char gb_msl_source[] ='
   for f in "$R"/suite/shaders/*.metal; do
-    sed -e 's/\\/\\\\/g' -e 's/"/\\"/g' -e 's/^/"/' -e 's/$/\\n"/' "$f"
+    [ "$(basename "$f")" = mesh.metal ] && continue
+    msl "$f"
   done
+  echo ';'
+  echo 'static const char gb_msl_mesh_source[] ='
+  msl "$R/suite/shaders/mesh.metal"
   echo ';'
 } > "$T/msl_sources.h"
 SHA=$(cat "$R/.suite_sha" 2>/dev/null || git -C "$R" describe --always --dirty=+dirty --abbrev=7 2>/dev/null || echo unknown)

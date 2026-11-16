@@ -21,6 +21,7 @@ path: that is what the suite measures.
 | `render.light` | 64x64 RGBA8 pass, load-op clear, `kind=tri` 1 triangle or `kind=clear` none | render-pass / tiler / firmware render path, render pairs |
 | `render.heavy` | `kind=fill`: 16 blended full-screen layers at 720p/1080p/2160p; `kind=geom`: 262144 small opaque triangles at 1080p | fill and geometry throughput, render scheduling at depth |
 | `render.tvb` | 1080p pass with N long thin triangles (8K/32K/128K) that cross many tiles; `dim=N` renders into an N x N target instead (Vulkan) | tiler memory (TVB) overflow, partial renders, heap growth; cold first-pass cost |
+| `render.mesh` | one mesh-shader draw (`vkCmdDrawMeshTasksEXT` / `drawMeshThreadgroups`) into a res x res RGBA8 target, optionally with a task/object stage, per-primitive outputs or two views; see [render.mesh](#rendermesh) | mesh/task launch, mesh output (vertex vs primitive heavy), multiview mesh, the render path behind it |
 | `sync.signal` | `kind=host`: CPU signals a semaphore a parked submission waits on; `kind=queue`: two queues ping-pong a semaphore (`sema=timeline` or `binary`) | wait-before-signal path, cross-queue dependency latency |
 | `mem.buffer` | create+allocate+bind, map, touch every 16 KiB page, unmap, free; plus a full alloc -> GPU fill -> wait -> free cycle; 4 KiB .. 64 MiB | GEM/VM bind, mmap, page-fault and free path |
 | `mem.image` | same for 2D RGBA8 images 256^2 .. 4096^2, cycle = alloc -> clear pass -> wait -> free | image allocation, layout and first-use path |
@@ -97,6 +98,92 @@ references, encode, commit), because Metal has no reusable command buffers.
 - All CPU times use the monotonic clock (`CLOCK_MONOTONIC` /
   `mach_absolute_time`).
 
+## render.mesh
+
+One draw per submission into a `res` x `res` RGBA8 colour target (a 2-layer
+array for `views=2`), load-op clear to (0, 0, 0, 0), store, no depth, no
+blending, no culling. Vulkan records `vkCmdDrawMeshTasksEXT` inside dynamic
+rendering (with `viewMask` 0b11 for `views=2`); Metal encodes
+`drawMeshThreadgroups:threadsPerObjectThreadgroup:threadsPerMeshThreadgroup:`
+with an `MTLMeshRenderPipelineDescriptor` pipeline. Same streams, windows and
+metrics as the other render tests, plus `mprim_s` (primitives rasterized per
+second, all views: groups x P x views per draw). The Vulkan executor enables
+`VK_EXT_mesh_shader` and core multiview for this test only and skips a row
+whose feature or limit is missing (`reason` names it). The result's
+`pipeline` object records the shaders, the workload counts, the device or
+pipeline limits and (Vulkan, with `VK_KHR_pipeline_executable_properties`)
+the compiler statistics of each stage.
+
+Parameters (both executors, identical meaning; `suite/vk/src/gb_mesh.h`
+holds the shared definition):
+
+| Param | Values | Meaning |
+| --- | --- | --- |
+| `stage` | `mesh` (default), `task` | `task`: a task (Vulkan) / object (Metal) workgroup of 32 threads launches 32 mesh workgroups and passes the index of the first in a 4-byte payload; the mesh workgroup index is `payload.base + local workgroup id`. The total mesh workgroups equal `groups`, which must be a multiple of 32 |
+| `wg` | `32` (default), `128` | threads per mesh workgroup |
+| `shape` | `prim` (default), `vert` | topo=tri geometry, below |
+| `perprim` | `0` (default), `1` | 1 adds per-primitive outputs, a flat `vec4` colour and a `uint` id (Vulkan `perprimitiveEXT`, Metal per-primitive data of the `mesh<>` type), which the fragment shader reads |
+| `views` | `1` (default), `2` | 2: two views into the 2-layer target; the colour depends on the view |
+| `topo` | `tri` (default), `line` | `line`: the coverage workload, below |
+| `groups` | 1..65535, default 4096 | mesh workgroups per draw (per view) |
+| `res` | 64..8192, default 1024 | target width and height |
+
+Geometry (identical on both sides; positions are in pixels with the origin at
+the top-left, converted to clip space as `p * 2/res - 1`, with y negated on
+Metal so that both APIs hit the same pixels):
+
+- Tiles (topo=tri): workgroup `g` draws into tile `g mod T` of a row-major
+  grid of `tiles_x = res / (GW*4)` by `res / (GH*4)` tiles, `T` tiles in all,
+  wrapping when `groups > T`. The tile holds a `GW` x `GH` grid of 4-pixel
+  cells (`GW, GH` = 8, 4 for wg=32 and 16, 8 for wg=128).
+- `shape=prim` (primitive heavy): V = wg vertices, P = 2*wg triangles.
+  Thread t writes vertex t at cell corner `(t mod GW, t div GW)` and
+  triangles 2t and 2t+1, the two halves of the quad whose top-left corner it
+  owns (diagonal a-e of corners a, b / d, e); a thread on the last column or
+  row splits the neighbouring quad along its other diagonal instead, so all
+  triangles are small (8 px) and non-degenerate. Per-vertex data: position
+  and one flat colour.
+- `shape=vert` (vertex heavy): V = min(2*wg, 128) vertices, P = V/4
+  triangles (wg=32: 64 and 16, wg=128: 128 and 32). Triangle p sits in cell
+  2p of the tile; vertices 4p..4p+3 are that cell's four corners, the
+  triangle uses the first three and the fourth is written but not referenced.
+  Each vertex also carries four smooth `vec4` varyings (functions of its pixel
+  position, index, group and colour) that the fragment shader adds into the
+  colour. V is capped at 128 (not 256) because Metal limits one `metal::mesh`
+  to 16 KB: 256 x 96 bytes would be 24 KB.
+- `topo=line` (coverage): V = 2*wg, P = wg. Thread t of workgroup g writes
+  vertices t and t + wg and line t, a 1-pixel horizontal segment over pixel
+  `i = (g*wg + t) mod res^2`, `x = i mod res`, `y = i div res`, on the row
+  centre `y + 0.5` from `x + 1/64` to `x + 1 + 1/64` (the last column runs
+  from `x + 1 - 1/64` to `x - 1/64`, so nothing is clipped). The segment holds
+  exactly one pixel centre (rectangle rule) and leaves exactly one diamond
+  (diamond-exit rule). So `groups=32768 wg=32 res=1024` covers the 1024x1024
+  target exactly once per view.
+- Colour of workgroup g in view v: `h = lowbias32(2g + v)`, RGBA8 bytes
+  `(h & 255, h >> 8 & 255, h >> 16 & 255, 255)`; lowbias32 is
+  `x ^= x >> 16; x *= 0x7feb352d; x ^= x >> 15; x *= 0x846ca68b; x ^= x >> 16`.
+  With `perprim=1` the primitive colour is the same and the id is
+  `g * P + primitive index`; the fragment shader outputs
+  `id < 2^31 ? mix(colour, primitive colour, 0.5) : 0`, i.e. the colour.
+- Push constants (Vulkan) / `setMeshBytes` (Metal): `tiles_x, tiles_total,
+  res, res^2` as four `uint`s.
+
+Estimated GPU time per draw on Neo (from `render.heavy kind=geom`, about
+300 Mtri/s on macOS): the plan's primitive rows (262144 triangles) about
+1 ms, the vertex rows (25 MB / 12.5 MB of vertex output) a few hundred us,
+the coverage row (2M one-pixel lines) a few ms.
+
+`--check` (topo=line only; other rows report `check_status:
+"not_checkable"`): after the timed pass the executor reads back every layer
+and compares each pixel with its expected colour, the colour of the last
+workgroup whose span covers it, each channel within +-1, or the clear colour
+where no span reaches. The row gets `check_status`, `check_pixels`,
+`check_bad`, `check_missing_blocks` ((view, workgroup) spans still entirely at
+the clear colour), `check_wrong_view` (bad pixels holding the other view's
+colour) and `check_pass`; a failed check makes the row `"status": "fail"` and
+the executor exit 1. In mode=procs each process checks its own target and the
+row adds them up.
+
 ## Diagnostics
 
 These flags are off by default and do not change any plan row when absent.
@@ -164,7 +251,10 @@ Rows they change carry `"diagnostic": [...]`; they are not perf rows.
 ## Layout
 
 - `shaders/`: GLSL (compiled to SPIR-V at build time) and the MSL with the
-  same algorithm. One file pair per shader.
+  same algorithm. One file pair per shader. render.mesh has one GLSL file per
+  stage (`mesh.mesh`, `mesh.task`, `mesh.frag`, built in variants with `-D`)
+  and one MSL file (`mesh.metal`), which the Metal executor compiles per
+  configuration with the same macros, apart from the main library.
 - `vk/`: Vulkan executor `gpubench-vk` (C11, CMake, Vulkan loader + headers,
   glslang). Static libraries `gb_common` (CLI, stats, JSON, timing, child
   processes) and `gb_vk` (instance/device/queue, buffers, images, pipelines,

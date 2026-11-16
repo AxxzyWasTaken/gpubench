@@ -28,4 +28,8 @@
 #define GB_TOUCH_STRIDE 16384           /* mem.*: one write per 16 KiB page */
 #define GB_IDLE_BUDGET_MS 1500           /* idle.wake: samples = budget / gap_ms, clamped */
 #define GB_IDLE_MIN_SAMPLES 6
+#define GB_MESH_GROUPS 4096u            /* render.mesh: default mesh workgroups per draw */
+#define GB_MESH_RES 1024u               /* render.mesh: default target size */
+#define GB_MESH_CELL 4u                 /* render.mesh topo=tri: pixels per grid cell */
+#define GB_MESH_FANOUT 32u              /* render.mesh stage=task: threads per task group = mesh groups it launches */
 #define GB_IDLE_MAX_SAMPLES 40

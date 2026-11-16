@@ -1,0 +1,16 @@
+// SPDX-License-Identifier: GPL-2.0-only
+#version 460
+// render.mesh stage=task: each task workgroup of 32 threads launches 32 mesh
+// workgroups and passes the index of the first one in the payload.
+#extension GL_EXT_mesh_shader : require
+layout(local_size_x = 32, local_size_y = 1, local_size_z = 1) in;
+
+struct Payload { uint base; };
+taskPayloadSharedEXT Payload payload;
+
+void main()
+{
+   if (gl_LocalInvocationIndex == 0u)
+      payload.base = gl_WorkGroupID.x * 32u;
+   EmitMeshTasksEXT(32u, 1u, 1u);
+}

@@ -15,3 +15,11 @@ GB_SHADER(tvb_vert)
 #undef GB_SHADER
 
 #define GB_SPV(n) n, n##_size
+
+/* render.mesh variants, looked up by name (suite/vk/CMakeLists.txt). */
+struct gb_spv_entry {
+   const char *name;
+   const uint32_t *code;
+   size_t size;
+};
+extern const struct gb_spv_entry gb_mesh_spv[];
