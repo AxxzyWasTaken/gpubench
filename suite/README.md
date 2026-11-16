@@ -97,6 +97,41 @@ references, encode, commit), because Metal has no reusable command buffers.
 - All CPU times use the monotonic clock (`CLOCK_MONOTONIC` /
   `mach_absolute_time`).
 
+## Diagnostics
+
+These flags are off by default and do not change any plan row when absent.
+Rows they change carry `"diagnostic": [...]`; they are not perf rows.
+
+- `--interval-log FILE`: one JSON line per completed command buffer, appended
+  to FILE (to `FILE.<pid>` in each mode=procs child; the parent writes
+  nothing): `pid, test, params, mode, ring, slot, pass` (0 untimed, 1 timed),
+  `measured, iter` (submission index), `clock, gpu_start, gpu_end, host_submit,
+  host_done, host_clock` (seconds). Metal: `GPUStartTime`/`GPUEndTime`, and
+  host times from `mach_absolute_time`, all on the mach host clock
+  (`mach_host`), comparable across processes. Vulkan: a top-of-pipe /
+  all-commands timestamp pair in every submission, converted with
+  `timestampPeriod`, on the device clock (`vk_device`; comparable across
+  processes on one device, not with the host), and host times on
+  `CLOCK_MONOTONIC`. Each configuration first writes a header line
+  `{"header":"pipeline", ..., "pipeline": {...}}` (render.mesh: the row's
+  `pipeline` object, else null). On Vulkan the timestamps change the untimed
+  pass, so such rows are marked `"diagnostic": ["interval-log"]`; on Metal the
+  times are free and the flag alone does not mark the row.
+- `--check-each` (render.mesh topo=line, mode queue or procs): every
+  submission renders into its own ring slot's target and copies it to a
+  host-visible buffer at the end of the same command buffer (Vulkan: layout
+  barriers and `vkCmdCopyImageToBuffer`; Metal: a fence and a blit); the CPU
+  checks it when the submission completes, warm-up included. Totals go into
+  the row as `check_each_*` (`iters`, `bad_iters` and the `--check` fields);
+  with `--interval-log` each line also carries `check_bad,
+  check_missing_blocks, check_wrong_view, check_pass`.
+- `--count N`: every pass submits exactly N measured command buffers (after
+  `--warmup-ms`) in one window that runs from the first measured submission to
+  the last completion, instead of `--runs` x `--run-ms` windows. In mode=procs
+  each child submits N; the merged window ends with the last child.
+  `--timestamps off` skips the timed pass (on Vulkan `--interval-log` already
+  stamps every submission).
+
 ## API equivalents and reading notes
 
 - **Semaphores:** Vulkan timeline and binary semaphores have no exact Metal
@@ -163,13 +198,16 @@ Options every executor accepts (unknown `--param` keys are an error):
 | `--run-ms N` | window length |
 | `--timestamps on\|off` | run the timed pass |
 | `--device N` | device index (Vulkan) |
+| `--check` | verify the render target after the timed pass (render.mesh topo=line) |
+| `--check-each`, `--interval-log FILE`, `--count N` | diagnostics, see [Diagnostics](#diagnostics) |
 
 Output: each configuration prints exactly one line on stdout that is a JSON
 object with `"schema": "gpubench-result/1"` (see `records/SCHEMA.md`).
 Anything else goes to stderr. A configuration the device cannot run prints a
 result with `"status": "skip"` and a `"reason"`; a configuration that fails
 prints `"status": "fail"` and an `"error"`. The exit status is non-zero only
-when the executor could not run at all.
+when the executor could not run at all, or (exit 1) when a `--check` or
+`--check-each` failed.
 
 ## Plans and the runner
 

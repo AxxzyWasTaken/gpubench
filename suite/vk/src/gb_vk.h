@@ -26,6 +26,14 @@ struct gb_vk {
    uint32_t mem_host; /* HOST_VISIBLE | HOST_COHERENT, device-local when available */
    uint32_t mem_dev;  /* DEVICE_LOCAL */
    VkCommandPool oneshot_pool;
+   /* Filled when gb_vk_want_mesh_shader was set (render.mesh). The features
+    * are the ones enabled on the device: every supported one of meshShader,
+    * taskShader, multiviewMeshShader and core multiview. */
+   bool exec_props;   /* VK_KHR_pipeline_executable_properties enabled */
+   bool mesh_ext;     /* VK_EXT_mesh_shader enabled */
+   bool multiview;
+   VkPhysicalDeviceMeshShaderFeaturesEXT mesh_feat;
+   VkPhysicalDeviceMeshShaderPropertiesEXT mesh_props;
 };
 
 #define GB_VK_CHECK(call)                                                        \
@@ -37,6 +45,10 @@ struct gb_vk {
 
 /* Set before gb_vk_create to enable VK_KHR_pipeline_executable_properties. */
 extern bool gb_vk_want_pipeline_stats;
+/* Set before gb_vk_create to enable VK_EXT_mesh_shader (when present) and
+ * core multiview. Off for every test but render.mesh, so no other test runs
+ * on a device with extra features enabled. */
+extern bool gb_vk_want_mesh_shader;
 
 /* Creates instance + device with `nqueues` queues of the first graphics+compute
  * family. Returns 0, or -1 when the device has fewer queues (vk is then
@@ -111,6 +123,11 @@ void gb_begin_render(VkCommandBuffer cb, const struct gb_img *im, const float cl
  * timing method. */
 typedef void (*gb_record_fn)(void *user, VkCommandBuffer cb, uint64_t k);
 typedef void (*gb_done_fn)(void *user, uint64_t k, int slot);
+/* Optional: record with the ring slot (per-slot resources). */
+typedef void (*gb_record_slot_fn)(void *user, VkCommandBuffer cb, uint64_t k, int slot);
+/* Optional: extra fields for the --interval-log line of the submission just
+ * completed (called after `done`). */
+typedef void (*gb_ilog_extra_fn)(void *user, struct gb_json *j);
 
 struct gb_stream {
    struct gb_vk *vk;
@@ -126,15 +143,19 @@ struct gb_stream {
    gb_done_fn done;
    void *user;
    bool failed;
+   gb_record_slot_fn record_slot; /* used instead of record when set */
+   gb_ilog_extra_fn ilog_extra;
+   bool ilog;         /* --interval-log: timestamp and log every submission */
+   long count;        /* --count: measured submissions per pass (0: windows) */
+   int pass_index;    /* 0 untimed, 1 timed (interval-log lines) */
 };
-
-
 
 void gb_stream_init(struct gb_stream *s, struct gb_vk *vk, int queue_index, int depth,
                     gb_record_fn record, gb_done_fn done, void *user);
 void gb_stream_finish(struct gb_stream *s);
-/* Runs the stream from absolute time t0: warm-up, then nwin windows. Returns
- * 0, or -1 on a GPU timeout (pass->failed). */
+/* Runs the stream from absolute time t0: warm-up, then nwin windows (or, with
+ * s->count, exactly s->count measured submissions in one window). Returns 0,
+ * or -1 on a GPU timeout (pass->failed). */
 int gb_stream_run(struct gb_stream *s, bool timed, uint64_t t0, uint64_t warmup_ns, int nwin,
                   uint64_t win_ns, struct gb_pass *out);
 /* One submission, round trip in microseconds (for cold first-use costs). */
@@ -156,5 +177,23 @@ struct gb_stream_test {
    /* derived throughput metrics from per-window us_per_submit */
    void (*derive)(const struct gb_opts *o, struct gb_result *r, const struct gb_samples *us_per_submit);
    bool no_timed; /* never run the timed pass (the test has no GPU work to time) */
+   /* Optional per-slot recording and interval-log fields (see gb_stream). */
+   gb_record_slot_fn record_slot;
+   gb_ilog_extra_fn ilog_extra;
+   /* --check: verify the render target after the timed pass (the stream is
+    * idle). Fills `out`; out->checked = 0 with a note when the configuration
+    * is not checkable. */
+   void (*check)(struct gb_vk *vk, void *state, struct gb_check *out);
+   /* --check-each: per-submission totals collected by `done`; reset with
+    * `each_reset` before each depth. NULL: --check-each unsupported. */
+   void (*check_each_totals)(void *state, struct gb_check *out);
+   void (*check_each_reset)(void *state);
+   /* mode=procs: run setup once in the parent first, so a configuration the
+    * device cannot run is a skip row rather than a child failure. */
+   bool probe_procs;
+   /* Optional: a JSON object describing the configuration's pipeline (limits,
+    * compiler statistics). Added to each result as "pipeline" and written as
+    * the --interval-log header line. Returns a malloc'ed string or NULL. */
+   char *(*row_info)(struct gb_vk *vk, void *state);
 };
 int gb_run_stream_test(const struct gb_opts *o, const struct gb_stream_test *t);

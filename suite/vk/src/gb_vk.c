@@ -10,6 +10,7 @@
 #define GPU_TIMEOUT_NS (10ull * 1000000000ull)
 
 bool gb_vk_want_pipeline_stats = false;
+bool gb_vk_want_mesh_shader = false;
 
 /* ---------------- instance / device ---------------- */
 
@@ -127,9 +128,72 @@ gb_vk_create(struct gb_vk *vk, int device_index, int nqueues)
       .pipelineExecutableInfo = VK_TRUE,
    };
    VkPhysicalDeviceFeatures2 e2 = {.sType = VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_FEATURES_2, .pNext = &e12};
-   const char *exts[1] = {VK_KHR_PIPELINE_EXECUTABLE_PROPERTIES_EXTENSION_NAME};
-   if (gb_vk_want_pipeline_stats)
+   const char *exts[3];
+   uint32_t nexts = 0;
+   if (gb_vk_want_pipeline_stats) {
       e13.pNext = &pef;
+      exts[nexts++] = VK_KHR_PIPELINE_EXECUTABLE_PROPERTIES_EXTENSION_NAME;
+   }
+
+   /* render.mesh: VK_EXT_mesh_shader plus core multiview, each feature
+    * enabled exactly when supported; the test skips what is missing. */
+   VkPhysicalDeviceVulkan11Features e11 = {.sType = VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_VULKAN_1_1_FEATURES};
+   VkPhysicalDeviceMeshShaderFeaturesEXT emesh = {.sType = VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_MESH_SHADER_FEATURES_EXT};
+   if (gb_vk_want_mesh_shader) {
+      uint32_t ne = 0;
+      vkEnumerateDeviceExtensionProperties(vk->pdev, NULL, &ne, NULL);
+      VkExtensionProperties *ep = calloc(ne ? ne : 1, sizeof(*ep));
+      vkEnumerateDeviceExtensionProperties(vk->pdev, NULL, &ne, ep);
+      for (uint32_t i = 0; i < ne; i++)
+         if (!strcmp(ep[i].extensionName, VK_EXT_MESH_SHADER_EXTENSION_NAME))
+            vk->mesh_ext = true;
+      VkPhysicalDeviceVulkan11Features q11 = {.sType = VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_VULKAN_1_1_FEATURES};
+      VkPhysicalDeviceMeshShaderFeaturesEXT qmesh = {.sType = VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_MESH_SHADER_FEATURES_EXT};
+      VkPhysicalDeviceFeatures2 q2 = {.sType = VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_FEATURES_2, .pNext = &q11};
+      if (vk->mesh_ext)
+         q11.pNext = &qmesh;
+      vkGetPhysicalDeviceFeatures2(vk->pdev, &q2);
+      vk->multiview = q11.multiview;
+      e11.multiview = q11.multiview;
+      bool have_ep = false;
+      for (uint32_t i = 0; i < ne; i++)
+         if (!strcmp(ep[i].extensionName, VK_KHR_PIPELINE_EXECUTABLE_PROPERTIES_EXTENSION_NAME))
+            have_ep = true;
+      free(ep);
+      void **tail = gb_vk_want_pipeline_stats ? &pef.pNext : &e13.pNext;
+      if (have_ep && !gb_vk_want_pipeline_stats) {
+         /* compiler statistics for the result's "pipeline" object */
+         VkPhysicalDevicePipelineExecutablePropertiesFeaturesKHR qep = {
+            .sType = VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_PIPELINE_EXECUTABLE_PROPERTIES_FEATURES_KHR};
+         VkPhysicalDeviceFeatures2 qf = {.sType = VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_FEATURES_2, .pNext = &qep};
+         vkGetPhysicalDeviceFeatures2(vk->pdev, &qf);
+         if (qep.pipelineExecutableInfo) {
+            *tail = &pef;
+            tail = &pef.pNext;
+            exts[nexts++] = VK_KHR_PIPELINE_EXECUTABLE_PROPERTIES_EXTENSION_NAME;
+         }
+      }
+      *tail = &e11;
+      if (vk->mesh_ext) {
+         emesh.meshShader = qmesh.meshShader;
+         emesh.taskShader = qmesh.taskShader;
+         emesh.multiviewMeshShader = qmesh.multiviewMeshShader && q11.multiview;
+         vk->mesh_feat = emesh;
+         vk->mesh_feat.pNext = NULL;
+         if (!emesh.meshShader)
+            vk->mesh_ext = false; /* the extension without its required feature */
+         else {
+            e11.pNext = &emesh;
+            exts[nexts++] = VK_EXT_MESH_SHADER_EXTENSION_NAME;
+            VkPhysicalDeviceMeshShaderPropertiesEXT mp = {
+               .sType = VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_MESH_SHADER_PROPERTIES_EXT};
+            VkPhysicalDeviceProperties2 pp = {.sType = VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_PROPERTIES_2, .pNext = &mp};
+            vkGetPhysicalDeviceProperties2(vk->pdev, &pp);
+            vk->mesh_props = mp;
+            vk->mesh_props.pNext = NULL;
+         }
+      }
+   }
 
    float prio[GB_MAX_QUEUES];
    for (int i = 0; i < GB_MAX_QUEUES; i++)
@@ -145,10 +209,13 @@ gb_vk_create(struct gb_vk *vk, int device_index, int nqueues)
       .pNext = &e2,
       .queueCreateInfoCount = 1,
       .pQueueCreateInfos = &qci,
-      .enabledExtensionCount = gb_vk_want_pipeline_stats ? 1 : 0,
+      .enabledExtensionCount = nexts,
       .ppEnabledExtensionNames = exts,
    };
    GB_VK_CHECK(vkCreateDevice(vk->pdev, &dci, NULL, &vk->dev));
+   for (uint32_t i = 0; i < nexts; i++)
+      if (!strcmp(exts[i], VK_KHR_PIPELINE_EXECUTABLE_PROPERTIES_EXTENSION_NAME))
+         vk->exec_props = true;
    for (int i = 0; i < nqueues; i++)
       vkGetDeviceQueue(vk->dev, vk->qfam, i, &vk->queues[i]);
 
@@ -642,6 +709,7 @@ gb_stream_init(struct gb_stream *s, struct gb_vk *vk, int queue_index, int depth
    s->record = record;
    s->done = done;
    s->user = user;
+   s->ilog = gb_ilog_enabled();
    s->pools = calloc(depth, sizeof(VkCommandPool));
    s->cbs = calloc(depth, sizeof(VkCommandBuffer));
    s->submit_ns = calloc(depth, sizeof(uint64_t));
@@ -710,7 +778,10 @@ record_slot(struct gb_stream *s, int slot, uint64_t k, bool timed)
    vkBeginCommandBuffer(cb, &bi);
    if (timed)
       vkCmdWriteTimestamp2(cb, VK_PIPELINE_STAGE_2_TOP_OF_PIPE_BIT, s->qp, 2 * slot);
-   s->record(s->user, cb, k);
+   if (s->record_slot)
+      s->record_slot(s->user, cb, k, slot);
+   else
+      s->record(s->user, cb, k);
    if (timed)
       vkCmdWriteTimestamp2(cb, VK_PIPELINE_STAGE_2_ALL_COMMANDS_BIT, s->qp, 2 * slot + 1);
    vkEndCommandBuffer(cb);
@@ -774,66 +845,111 @@ gb_stream_once(struct gb_stream *s)
    return (t1 - t0) / 1e3;
 }
 
+static void
+ilog_line(struct gb_stream *s, uint64_t iter, int slot, bool measured, uint64_t t_done, bool have_gpu, uint64_t a,
+          uint64_t b)
+{
+   struct gb_ilog_rec rec = {
+      .iter = iter,
+      .slot = slot,
+      .ring = s->depth,
+      .pass = s->pass_index,
+      .measured = measured,
+      .have_gpu = have_gpu,
+      .gpu_start = (double)a * s->vk->ts_period_ns / 1e9,
+      .gpu_end = (double)b * s->vk->ts_period_ns / 1e9,
+      .host_submit = s->submit_ns[slot] / 1e9,
+      .host_done = t_done / 1e9,
+      .clock = "vk_device",
+      .host_clock = "CLOCK_MONOTONIC",
+   };
+   gb_ilog_write(&rec, s->ilog_extra, s->user);
+}
+
+static bool
+read_stamps(struct gb_stream *s, int slot, uint64_t *a, uint64_t *b)
+{
+   uint64_t ts[2];
+   bool ok = vkGetQueryPoolResults(s->vk->dev, s->qp, 2 * slot, 2, sizeof(ts), ts, sizeof(uint64_t),
+                                   VK_QUERY_RESULT_64_BIT | VK_QUERY_RESULT_WAIT_BIT) == VK_SUCCESS;
+   *a = ts[0] & s->vk->ts_mask;
+   *b = ts[1] & s->vk->ts_mask;
+   vkResetQueryPool(s->vk->dev, s->qp, 2 * slot, 2);
+   return ok;
+}
+
 int
 gb_stream_run(struct gb_stream *s, bool timed, uint64_t t0, uint64_t warmup_ns, int nwin, uint64_t win_ns,
               struct gb_pass *out)
 {
    memset(out, 0, sizeof(*out));
+   /* --count N: one window holding exactly N measured submissions; it runs
+    * from the first measured submission to the last completion. */
+   const bool counted = s->count > 0;
+   if (counted)
+      nwin = 1;
    out->nwin = nwin;
    out->win_s = win_ns / 1e9;
    out->timed = timed = timed && s->qp;
+   /* --interval-log stamps every submission, in both passes. */
+   const bool stamps = (timed || s->ilog) && s->qp;
    const uint64_t tm0 = t0 + warmup_ns, t_end = tm0 + (uint64_t)nwin * win_ns;
    const uint64_t base = s->value;
    const int depth = s->depth;
    uint64_t k = 0, done = 0, last_end = 0;
+   uint64_t mk0 = UINT64_MAX, t_first = 0, t_last = 0; /* counted */
    bool have_last = false;
 
    gb_sleep_until_ns(t0);
    for (;;) {
       uint64_t now = gb_now_ns();
       bool full = k - done >= (uint64_t)depth;
-      if (!full && now >= t_end)
+      bool more = counted ? mk0 == UINT64_MAX || k - mk0 < (uint64_t)s->count : now < t_end;
+      if (!more && (counted ? done == k : !full))
          break;
-      if (full || (done < k && now >= t_end)) {
+      if (full || !more) {
          /* complete the oldest submission */
          int slot = done % depth;
          if (wait_value(s, base + done + 1))
             break;
          uint64_t t = gb_now_ns();
-         bool measured = t >= tm0 && t < t_end;
+         bool measured = counted ? mk0 != UINT64_MAX && done >= mk0 : t >= tm0 && t < t_end;
          if (measured) {
-            out->win_count[(t - tm0) / win_ns]++;
+            out->win_count[counted ? 0 : (t - tm0) / win_ns]++;
             gb_samples_push(&out->latency, (t - s->submit_ns[slot]) / 1e3);
+            t_last = t;
          }
-         if (timed) {
-            uint64_t ts[2];
-            if (vkGetQueryPoolResults(s->vk->dev, s->qp, 2 * slot, 2, sizeof(ts), ts, sizeof(uint64_t),
-                                      VK_QUERY_RESULT_64_BIT | VK_QUERY_RESULT_WAIT_BIT) == VK_SUCCESS) {
-               uint64_t a = ts[0] & s->vk->ts_mask, b = ts[1] & s->vk->ts_mask;
-               if (measured) {
-                  /* A driver may write the top-of-pipe stamp as soon as the
-                   * queue reaches it, before earlier submissions finish, so
-                   * b - a would include their work at depth > 1. Count this
-                   * submission from the later of its stamp and the previous
-                   * end. gpu_gap_us keeps the raw difference. */
-                  uint64_t start = have_last && last_end > a ? last_end : a;
-                  gb_samples_push(&out->gpu, b > start ? (double)(b - start) * s->vk->ts_period_ns / 1e3 : 0);
-                  if (have_last)
-                     gb_samples_push(&out->gap, ((double)a - (double)last_end) * s->vk->ts_period_ns / 1e3);
-               }
-               last_end = b;
-               have_last = true;
+         uint64_t a = 0, b = 0;
+         bool have = false;
+         if (stamps && (have = read_stamps(s, slot, &a, &b)) && timed) {
+            if (measured) {
+               /* A driver may write the top-of-pipe stamp as soon as the
+                * queue reaches it, before earlier submissions finish, so
+                * b - a would include their work at depth > 1. Count this
+                * submission from the later of its stamp and the previous
+                * end. gpu_gap_us keeps the raw difference. */
+               uint64_t start = have_last && last_end > a ? last_end : a;
+               gb_samples_push(&out->gpu, b > start ? (double)(b - start) * s->vk->ts_period_ns / 1e3 : 0);
+               if (have_last)
+                  gb_samples_push(&out->gap, ((double)a - (double)last_end) * s->vk->ts_period_ns / 1e3);
             }
-            vkResetQueryPool(s->vk->dev, s->qp, 2 * slot, 2);
+            last_end = b;
+            have_last = true;
          }
          if (s->done)
             s->done(s->user, base + done + 1, slot);
+         if (s->ilog)
+            ilog_line(s, base + done + 1, slot, measured, t, have, a, b);
          done++;
          continue;
       }
       int slot = k % depth;
       uint64_t r0 = gb_now_ns();
-      record_slot(s, slot, base + k + 1, timed);
+      if (counted && mk0 == UINT64_MAX && r0 >= tm0) {
+         mk0 = k;
+         t_first = r0;
+      }
+      record_slot(s, slot, base + k + 1, stamps);
       uint64_t r1 = gb_now_ns();
       s->submit_ns[slot] = r1;
       VkResult vr = submit_slot(s, slot, base + k + 1);
@@ -843,20 +959,27 @@ gb_stream_run(struct gb_stream *s, bool timed, uint64_t t0, uint64_t warmup_ns, 
          s->failed = true;
          break;
       }
-      if (r0 >= tm0 && r0 < t_end) {
+      if (counted ? mk0 != UINT64_MAX : r0 >= tm0 && r0 < t_end) {
          gb_samples_push(&out->record_cpu, (r1 - r0) / 1e3);
          gb_samples_push(&out->submit_cpu, (r2 - r1) / 1e3);
       }
       k++;
    }
    /* drain whatever is still in flight (not counted) */
-   if (!s->failed && k > done)
-      wait_value(s, base + k);
-   if (timed && k > done)
+   for (; done < k; done++) {
+      int slot = done % depth;
+      bool ok = !s->failed && !wait_value(s, base + done + 1);
+      uint64_t t = gb_now_ns(), a = 0, b = 0;
+      bool have = ok && stamps && read_stamps(s, slot, &a, &b);
+      if (s->done)
+         s->done(s->user, base + done + 1, slot);
+      if (s->ilog && ok)
+         ilog_line(s, base + done + 1, slot, false, t, have, a, b);
+   }
+   if (stamps && s->failed)
       vkResetQueryPool(s->vk->dev, s->qp, 0, 2 * depth);
-   if (s->done)
-      for (; done < k; done++)
-         s->done(s->user, base + done + 1, done % depth);
+   if (counted && t_last > t_first)
+      out->win_s = (t_last - t_first) / 1e9;
    s->value = base + k;
    for (int i = 0; i < nwin; i++)
       out->submits += out->win_count[i];
@@ -902,13 +1025,23 @@ run_threads(struct gb_stream *streams, int n, bool timed, uint64_t warm, int nwi
    free(t);
 }
 
+struct checks {
+   struct gb_check end, each;
+};
+
 static void
 finish_result(const struct gb_opts *o, const struct gb_stream_test *t, enum gb_mode mode, int depth,
-              struct gb_pass *u, struct gb_pass *ti, double first_us, int units)
+              struct gb_pass *u, struct gb_pass *ti, double first_us, int units, const struct checks *c,
+              const char *pinfo)
 {
    struct gb_result r;
    gb_result_begin(&r, o, mode, depth, NULL);
    gb_result_run_info(&r, o->warmup_ms, o->runs, o->run_ms);
+   if (pinfo)
+      gb_json_raw(&r.j, "pipeline", pinfo);
+   /* Vulkan needs a timestamp pair in every submission for the interval
+    * log, so the untimed pass is no longer untimed. */
+   gb_result_diagnostic(&r, true);
    if (u->failed || (ti && ti->failed)) {
       gb_result_finish(&r, "fail", NULL, "GPU wait timed out or submit failed");
       return;
@@ -932,7 +1065,16 @@ finish_result(const struct gb_opts *o, const struct gb_stream_test *t, enum gb_m
    if (mode != GB_MODE_QUEUE)
       gb_json_int(&r.j, mode == GB_MODE_PROCS ? "procs" : "queues", units);
    gb_json_obj_end(&r.j);
-   gb_result_finish(&r, "ok", "us_per_submit", NULL);
+   bool bad = false;
+   if (o->check && c) {
+      gb_result_check(&r, &c->end, false);
+      bad |= c->end.checked && !c->end.pass;
+   }
+   if (o->check_each && c) {
+      gb_result_check(&r, &c->each, true);
+      bad |= c->each.checked && !c->each.pass;
+   }
+   gb_result_finish(&r, bad ? "fail" : "ok", "us_per_submit", bad ? "render check failed (see check_* fields)" : NULL);
 }
 
 static uint64_t
@@ -940,6 +1082,34 @@ timed_warm(const struct gb_opts *o)
 {
    uint64_t w = (uint64_t)o->warmup_ms * 1000000ull;
    return w < 100000000ull ? w : 100000000ull;
+}
+
+static void
+stream_setup(struct gb_stream *s, const struct gb_opts *o, const struct gb_stream_test *t)
+{
+   s->record_slot = t->record_slot;
+   s->ilog_extra = t->ilog_extra;
+   s->count = o->count;
+}
+
+/* After the timed pass, with the stream idle. */
+static void
+collect_checks(struct gb_vk *vk, const struct gb_opts *o, const struct gb_stream_test *t, void *st,
+               struct checks *c)
+{
+   memset(c, 0, sizeof(*c));
+   if (o->check) {
+      if (t->check)
+         t->check(vk, st, &c->end);
+      else
+         snprintf(c->end.note, sizeof(c->end.note), "--check is not supported by %s", t->name);
+   }
+   if (o->check_each) {
+      if (t->check_each_totals)
+         t->check_each_totals(st, &c->each);
+      else
+         snprintf(c->each.note, sizeof(c->each.note), "--check-each is not supported by %s", t->name);
+   }
 }
 
 static int
@@ -954,11 +1124,25 @@ run_child(const struct gb_opts *o, const struct gb_stream_test *t)
       gb_log("child setup failed: %s", err);
       return 1;
    }
+   gb_ilog_setup(o);
+   if (gb_ilog_enabled() && t->row_info) {
+      char *pinfo = t->row_info(&vk, st);
+      gb_ilog_header(pinfo);
+      free(pinfo);
+   }
    struct gb_stream s;
    gb_stream_init(&s, &vk, 0, 1, t->record, t->done, st);
+   stream_setup(&s, o, t);
    struct gb_pass prime;
+   s.ilog = false;
+   long count = s.count;
+   s.count = 0;
    gb_stream_run(&s, false, gb_now_ns(), 0, 1, 30000000ull, &prime); /* build contexts before READY */
    gb_pass_free(&prime);
+   s.ilog = gb_ilog_enabled();
+   s.count = count;
+   if (t->check_each_reset)
+      t->check_each_reset(st);
    gb_child_ready();
    const uint64_t W = (uint64_t)o->warmup_ms * 1000000ull, R = (uint64_t)o->run_ms * 1000000ull;
    for (int pass = 0;; pass++) {
@@ -967,19 +1151,52 @@ run_child(const struct gb_opts *o, const struct gb_stream_test *t)
          break;
       bool timed = pass == 1;
       struct gb_pass p;
+      s.pass_index = timed;
       gb_stream_run(&s, timed, t0, timed ? timed_warm(o) : W, timed ? o->timed_runs : o->runs, R, &p);
       gb_pass_put(1, &p);
       gb_pass_free(&p);
    }
    gb_stream_finish(&s);
+   struct checks c;
+   collect_checks(&vk, o, t, st, &c);
+   if (o->check)
+      gb_check_put(1, &c.end);
+   if (o->check_each)
+      gb_check_put(1, &c.each);
+   gb_ilog_close();
    t->teardown(&vk, st);
    gb_vk_destroy(&vk);
    return 0;
 }
 
+/* render.mesh and friends: run setup once in the parent before spawning, so a
+ * missing feature becomes a clean skip row instead of a child failure. */
+static bool
+probe_in_parent(const struct gb_opts *o, const struct gb_stream_test *t, const int *depths, int nd, char **pinfo)
+{
+   struct gb_vk vk;
+   gb_vk_create(&vk, o->device, 1);
+   char err[256] = "";
+   void *st = t->setup(&vk, o, err, sizeof(err));
+   if (st) {
+      if (t->row_info)
+         *pinfo = t->row_info(&vk, st);
+      t->teardown(&vk, st);
+   }
+   gb_vk_destroy(&vk);
+   if (st)
+      return true;
+   for (int i = 0; i < nd; i++)
+      gb_result_simple(o, GB_MODE_PROCS, depths[i], NULL, "skip", err[0] ? err : "setup failed");
+   return false;
+}
+
 static void
 run_procs(const struct gb_opts *o, const struct gb_stream_test *t, const int *depths, int nd)
 {
+   char *pinfo = NULL;
+   if (t->probe_procs && !probe_in_parent(o, t, depths, nd, &pinfo))
+      return;
    for (int di = 0; di < nd; di++) {
       int n = depths[di];
       struct gb_child *ch = calloc(n, sizeof(*ch));
@@ -1008,17 +1225,37 @@ run_procs(const struct gb_opts *o, const struct gb_stream_test *t, const int *de
             gb_pass_free(&p);
          }
       }
-      for (int i = 0; i < n; i++) {
+      for (int i = 0; i < n; i++)
          gb_child_send_u64(&ch[i], 0);
-         gb_child_reap(&ch[i]);
+      /* Each child checks its own target; a child that cannot report fails the check. */
+      struct checks c = {0};
+      for (int i = 0; i < n; i++) {
+         struct gb_check e, x;
+         if (o->check) {
+            if (gb_check_get(ch[i].from_child, &e)) {
+               e = (struct gb_check){.checked = 1, .pass = 0};
+               bad = true;
+            }
+            gb_check_add(&c.end, &e);
+         }
+         if (o->check_each) {
+            if (gb_check_get(ch[i].from_child, &x)) {
+               x = (struct gb_check){.checked = 1, .pass = 0};
+               bad = true;
+            }
+            gb_check_add(&c.each, &x);
+         }
       }
+      for (int i = 0; i < n; i++)
+         gb_child_reap(&ch[i]);
       if (bad)
          u.failed = true;
-      finish_result(o, t, GB_MODE_PROCS, n, &u, do_timed ? &ti : NULL, -1, n);
+      finish_result(o, t, GB_MODE_PROCS, n, &u, do_timed ? &ti : NULL, -1, n, &c, pinfo);
       gb_pass_free(&u);
       gb_pass_free(&ti);
       free(ch);
    }
+   free(pinfo);
 }
 
 int
@@ -1036,7 +1273,7 @@ gb_run_stream_test(const struct gb_opts *o, const struct gb_stream_test *t)
 
    if (o->mode == GB_MODE_PROCS) {
       run_procs(o, t, depths, nd);
-      return 0;
+      return gb_check_failed ? 1 : 0;
    }
 
    int need = 1;
@@ -1054,20 +1291,27 @@ gb_run_stream_test(const struct gb_opts *o, const struct gb_stream_test *t)
       gb_vk_destroy(&vk);
       return 0;
    }
+   gb_ilog_setup(o);
+   char *pinfo = t->row_info ? t->row_info(&vk, st) : NULL;
+   gb_ilog_header(pinfo);
    bool first = t->report_first;
    const bool do_timed = o->timestamps && !t->no_timed;
    for (int di = 0; di < nd; di++) {
       int n = depths[di];
       struct gb_pass u = {0}, ti = {0};
       double first_us = -1;
+      if (t->check_each_reset)
+         t->check_each_reset(st);
       if (o->mode == GB_MODE_QUEUE) {
          struct gb_stream s;
          gb_stream_init(&s, &vk, 0, n, t->record, t->done, st);
+         stream_setup(&s, o, t);
          if (first) {
             first_us = gb_stream_once(&s);
             first = false;
          }
          gb_stream_run(&s, false, gb_now_ns(), W, o->runs, R, &u);
+         s.pass_index = 1;
          if (do_timed && !s.failed)
             gb_stream_run(&s, true, gb_now_ns(), timed_warm(o), o->timed_runs, R, &ti);
          gb_stream_finish(&s);
@@ -1079,20 +1323,28 @@ gb_run_stream_test(const struct gb_opts *o, const struct gb_stream_test *t)
             continue;
          }
          struct gb_stream *ss = calloc(n, sizeof(*ss));
-         for (int i = 0; i < n; i++)
+         for (int i = 0; i < n; i++) {
             gb_stream_init(&ss[i], &vk, i, 1, t->record, t->done, st);
+            stream_setup(&ss[i], o, t);
+         }
          run_threads(ss, n, false, W, o->runs, R, &u);
+         for (int i = 0; i < n; i++)
+            ss[i].pass_index = 1;
          if (do_timed && !u.failed)
             run_threads(ss, n, true, timed_warm(o), o->timed_runs, R, &ti);
          for (int i = 0; i < n; i++)
             gb_stream_finish(&ss[i]);
          free(ss);
       }
-      finish_result(o, t, o->mode, n, &u, do_timed ? &ti : NULL, first_us, n);
+      struct checks c;
+      collect_checks(&vk, o, t, st, &c);
+      finish_result(o, t, o->mode, n, &u, do_timed ? &ti : NULL, first_us, n, &c, pinfo);
       gb_pass_free(&u);
       gb_pass_free(&ti);
    }
+   free(pinfo);
+   gb_ilog_close();
    t->teardown(&vk, st);
    gb_vk_destroy(&vk);
-   return 0;
+   return gb_check_failed ? 1 : 0;
 }

@@ -160,11 +160,16 @@ gb_parse_opts(struct gb_opts *o, int argc, char **argv)
          const char *v = NEXT();
          o->timestamps = !strcmp(v, "on") || !strcmp(v, "1");
       } else if (!strcmp(a, "--device")) o->device = atoi(NEXT());
+      else if (!strcmp(a, "--check")) o->check = true;
+      else if (!strcmp(a, "--check-each")) o->check_each = true;
+      else if (!strcmp(a, "--interval-log")) o->interval_log = NEXT();
+      else if (!strcmp(a, "--count")) o->count = atol(NEXT());
       else if (!strcmp(a, "--child")) o->child = true;
       else if (!strcmp(a, "--help") || !strcmp(a, "-h")) {
          printf("usage: %s --info | --list | --test NAME [--depths 1,2,4] [--mode queue|queues|procs]\n"
                 "       [--param k=v]... [--warmup-ms N] [--runs N] [--run-ms N] [--timed-runs N]\n"
-                "       [--timestamps on|off] [--device N]\n", argv[0]);
+                "       [--timestamps on|off] [--device N]\n"
+                "       [--check] [--check-each] [--interval-log FILE] [--count N]\n", argv[0]);
          exit(0);
       } else
          gb_die("unknown argument %s", a);
@@ -172,6 +177,10 @@ gb_parse_opts(struct gb_opts *o, int argc, char **argv)
    }
    if (o->runs < 1 || o->runs > GB_MAX_WIN || o->timed_runs < 0 || o->timed_runs > GB_MAX_WIN)
       gb_die("runs must be 1..%d", GB_MAX_WIN);
+   if (o->count < 0)
+      gb_die("--count must be >= 0");
+   if (o->run_ms <= 0 && !o->count)
+      gb_die("--run-ms must be > 0 (or use --count N)");
    return 0;
 }
 
@@ -432,6 +441,13 @@ gb_json_null(struct gb_json *j, const char *key)
 {
    jkey(j, key);
    jputs(j, "null");
+}
+
+void
+gb_json_raw(struct gb_json *j, const char *key, const char *json)
+{
+   jkey(j, key);
+   jputs(j, json);
 }
 
 /* ---------------- results ---------------- */
@@ -785,6 +801,10 @@ gb_pass_merge(struct gb_pass *d, const struct gb_pass *s)
       d->win_s = s->win_s;
       d->timed = s->timed;
    }
+   /* Equal in window mode; with --count each stream measures its own span
+    * from the common start, and the merged pass lasts until the last ends. */
+   if (s->win_s > d->win_s)
+      d->win_s = s->win_s;
    for (int i = 0; i < s->nwin && i < GB_MAX_WIN; i++)
       d->win_count[i] += s->win_count[i];
    gb_samples_append(&d->latency, &s->latency);
@@ -865,4 +885,210 @@ gb_derive_rate(struct gb_result *r, const char *name, const char *unit, const st
       gb_samples_push(&d, work_e6 / us->v[i]);
    gb_result_metric(r, name, unit, false, &d, true);
    gb_samples_free(&d);
+}
+
+/* ---------------- checks ---------------- */
+
+bool gb_check_failed = false;
+
+void
+gb_check_add(struct gb_check *d, const struct gb_check *s)
+{
+   if (!s->checked) {
+      if (!d->note[0])
+         snprintf(d->note, sizeof(d->note), "%s", s->note);
+      return;
+   }
+   d->pass = (d->checked ? d->pass : 1) && s->pass;
+   d->checked = 1;
+   d->pixels += s->pixels;
+   d->bad += s->bad;
+   d->missing_blocks += s->missing_blocks;
+   d->wrong_view += s->wrong_view;
+   d->iters += s->iters;
+   d->bad_iters += s->bad_iters;
+}
+
+int
+gb_check_put(int fd, const struct gb_check *c)
+{
+   return gb_write_all(fd, c, sizeof(*c));
+}
+
+int
+gb_check_get(int fd, struct gb_check *c)
+{
+   memset(c, 0, sizeof(*c));
+   if (gb_read_all(fd, c, sizeof(*c)))
+      return -1;
+   c->note[sizeof(c->note) - 1] = 0;
+   return 0;
+}
+
+void
+gb_result_check(struct gb_result *r, const struct gb_check *c, bool each)
+{
+   struct gb_json *j = &r->j;
+   const char *pfx = each ? "check_each_" : "check_";
+   char k[48];
+#define K(n) (snprintf(k, sizeof(k), "%s%s", pfx, n), k)
+   if (!c->checked) {
+      gb_json_str(j, K("status"), "not_checkable");
+      gb_json_str(j, K("reason"), c->note[0] ? c->note : "not checkable");
+      return;
+   }
+   gb_json_str(j, K("status"), c->pass ? "pass" : "fail");
+   if (each) {
+      gb_json_int(j, K("iters"), (int64_t)c->iters);
+      gb_json_int(j, K("bad_iters"), (int64_t)c->bad_iters);
+   }
+   gb_json_int(j, K("pixels"), (int64_t)c->pixels);
+   gb_json_int(j, K("bad"), (int64_t)c->bad);
+   gb_json_int(j, K("missing_blocks"), (int64_t)c->missing_blocks);
+   gb_json_int(j, K("wrong_view"), (int64_t)c->wrong_view);
+   gb_json_bool(j, K("pass"), c->pass);
+#undef K
+   fprintf(stderr, "gpubench: %s %s: %s pixels=%llu bad=%llu missing_blocks=%llu wrong_view=%llu", r->o->test,
+           each ? "check-each" : "check", c->pass ? "PASS" : "FAIL", (unsigned long long)c->pixels,
+           (unsigned long long)c->bad, (unsigned long long)c->missing_blocks, (unsigned long long)c->wrong_view);
+   if (each)
+      fprintf(stderr, " iters=%llu bad_iters=%llu", (unsigned long long)c->iters, (unsigned long long)c->bad_iters);
+   fputc('\n', stderr);
+   if (!c->pass)
+      gb_check_failed = true;
+}
+
+/* ---------------- interval log ---------------- */
+
+static pthread_mutex_t ilog_mu = PTHREAD_MUTEX_INITIALIZER;
+
+static void
+jnum9(struct gb_json *j, const char *key, double v)
+{
+   char b[48];
+   jkey(j, key);
+   snprintf(b, sizeof(b), "%.9f", v);
+   jputs(j, b);
+}
+static FILE *ilog_f;
+static const struct gb_opts *ilog_o;
+
+bool
+gb_ilog_enabled(void)
+{
+   return ilog_o != NULL;
+}
+
+void
+gb_ilog_setup(const struct gb_opts *o)
+{
+   if (!o->interval_log || ilog_o)
+      return;
+   char path[4096];
+   if (o->child)
+      snprintf(path, sizeof(path), "%s.%d", o->interval_log, (int)getpid());
+   else
+      snprintf(path, sizeof(path), "%s", o->interval_log);
+   ilog_f = fopen(path, "a");
+   if (!ilog_f)
+      gb_die("cannot open interval log %s", path);
+   ilog_o = o;
+}
+
+void
+gb_ilog_write(const struct gb_ilog_rec *r, void (*extra)(void *user, struct gb_json *j), void *user)
+{
+   if (!ilog_o)
+      return;
+   const struct gb_opts *o = ilog_o;
+   struct gb_json j;
+   gb_json_init(&j);
+   gb_json_obj_begin(&j, NULL);
+   gb_json_int(&j, "pid", (int64_t)getpid());
+   gb_json_str(&j, "test", o->test);
+   gb_json_obj_begin(&j, "params");
+   for (int i = 0; i < o->nparams; i++)
+      gb_json_str(&j, o->params[i].key, o->params[i].val);
+   gb_json_obj_end(&j);
+   gb_json_str(&j, "mode", gb_mode_name(o->mode));
+   gb_json_int(&j, "ring", r->ring);
+   gb_json_int(&j, "slot", r->slot);
+   gb_json_int(&j, "pass", r->pass);
+   gb_json_bool(&j, "measured", r->measured);
+   gb_json_int(&j, "iter", (int64_t)r->iter);
+   /* Absolute times need more digits than gb_json_num keeps. */
+   if (r->have_gpu) {
+      gb_json_str(&j, "clock", r->clock);
+      jnum9(&j, "gpu_start", r->gpu_start);
+      jnum9(&j, "gpu_end", r->gpu_end);
+   } else {
+      gb_json_null(&j, "gpu_start");
+      gb_json_null(&j, "gpu_end");
+   }
+   jnum9(&j, "host_submit", r->host_submit);
+   jnum9(&j, "host_done", r->host_done);
+   gb_json_str(&j, "host_clock", r->host_clock);
+   if (extra)
+      extra(user, &j);
+   gb_json_obj_end(&j);
+   pthread_mutex_lock(&ilog_mu);
+   fputs(j.buf, ilog_f);
+   fputc('\n', ilog_f);
+   pthread_mutex_unlock(&ilog_mu);
+   gb_json_free(&j);
+}
+
+void
+gb_ilog_header(const char *pipeline_json)
+{
+   if (!ilog_o)
+      return;
+   const struct gb_opts *o = ilog_o;
+   struct gb_json j;
+   gb_json_init(&j);
+   gb_json_obj_begin(&j, NULL);
+   gb_json_str(&j, "header", "pipeline");
+   gb_json_int(&j, "pid", (int64_t)getpid());
+   gb_json_str(&j, "test", o->test);
+   gb_json_obj_begin(&j, "params");
+   for (int i = 0; i < o->nparams; i++)
+      gb_json_str(&j, o->params[i].key, o->params[i].val);
+   gb_json_obj_end(&j);
+   gb_json_str(&j, "mode", gb_mode_name(o->mode));
+   gb_json_raw(&j, "pipeline", pipeline_json ? pipeline_json : "null");
+   gb_json_obj_end(&j);
+   pthread_mutex_lock(&ilog_mu);
+   fputs(j.buf, ilog_f);
+   fputc('\n', ilog_f);
+   pthread_mutex_unlock(&ilog_mu);
+   gb_json_free(&j);
+}
+
+void
+gb_ilog_close(void)
+{
+   pthread_mutex_lock(&ilog_mu);
+   if (ilog_f)
+      fclose(ilog_f);
+   ilog_f = NULL;
+   ilog_o = NULL;
+   pthread_mutex_unlock(&ilog_mu);
+}
+
+void
+gb_result_diagnostic(struct gb_result *r, bool ilog_changes_timing)
+{
+   const struct gb_opts *o = r->o;
+   if (!(o->check_each || o->count || (o->interval_log && ilog_changes_timing)))
+      return;
+   gb_json_arr_begin(&r->j, "diagnostic");
+   if (o->check_each)
+      gb_json_str(&r->j, NULL, "check-each");
+   if (o->interval_log && ilog_changes_timing)
+      gb_json_str(&r->j, NULL, "interval-log");
+   if (o->count)
+      gb_json_str(&r->j, NULL, "count");
+   gb_json_arr_end(&r->j);
+   if (o->count)
+      gb_json_int(&r->j, "count", o->count);
 }

@@ -33,6 +33,11 @@ struct gb_opts {
    bool timestamps;
    int device;
    bool info, list;
+   /* Diagnostics (suite/README.md "Diagnostics"); all off by default. */
+   bool check;                /* --check: verify the target after the timed pass */
+   bool check_each;           /* --check-each: verify every submission (diagnostic row) */
+   const char *interval_log;  /* --interval-log FILE: one JSON line per submission */
+   long count;                /* --count N: N measured submissions per pass instead of windows */
    /* child-process protocol (mode=procs) */
    bool child;
    int child_depth;
@@ -80,6 +85,8 @@ void gb_json_num(struct gb_json *j, const char *key, double v);
 void gb_json_int(struct gb_json *j, const char *key, int64_t v);
 void gb_json_bool(struct gb_json *j, const char *key, bool v);
 void gb_json_null(struct gb_json *j, const char *key);
+/* Appends already-serialized JSON (an object, array or value) under `key`. */
+void gb_json_raw(struct gb_json *j, const char *key, const char *json);
 
 /* A result being assembled for one configuration. */
 struct gb_result {
@@ -134,6 +141,49 @@ int gb_write_all(int fd, const void *p, size_t n);
 int gb_read_all(int fd, void *p, size_t n);
 int gb_wire_put_samples(int fd, const struct gb_samples *s);
 int gb_wire_get_samples(int fd, struct gb_samples *s);
+
+/* ---- render-target checks (--check, --check-each) ----
+ * One result per configuration; in mode=procs each child checks its own
+ * target and the parent adds the children's results. */
+struct gb_check {
+   int32_t checked;            /* 0: not run (see note), 1: run */
+   int32_t pass;
+   uint64_t pixels, bad, missing_blocks, wrong_view;
+   uint64_t iters, bad_iters;  /* --check-each: submissions checked / failed */
+   char note[96];
+};
+void gb_check_add(struct gb_check *d, const struct gb_check *s);
+int gb_check_put(int fd, const struct gb_check *c);
+int gb_check_get(int fd, struct gb_check *c);
+/* Writes the check_* fields of a result (each=true: the --check-each totals). */
+void gb_result_check(struct gb_result *r, const struct gb_check *c, bool each);
+/* Set when any check of this executor run failed: the executor exits 1. */
+extern bool gb_check_failed;
+
+/* ---- interval log (--interval-log FILE) ----
+ * One JSON line per completed command buffer. The file is FILE in the
+ * parent process and FILE.<pid> in a mode=procs child; lines are appended
+ * under a lock, so several streams of one process can share it. */
+struct gb_ilog_rec {
+   uint64_t iter;              /* submission index (the value passed to record) */
+   int slot, ring, pass;       /* ring slot, ring depth, 0 untimed / 1 timed pass */
+   bool measured;              /* completed inside a measured window */
+   bool have_gpu;
+   double gpu_start, gpu_end;  /* seconds on `clock` */
+   double host_submit, host_done; /* seconds on `host_clock` */
+   const char *clock, *host_clock;
+};
+bool gb_ilog_enabled(void);
+/* Must be called once before streams start (stores opts for the lines). */
+void gb_ilog_setup(const struct gb_opts *o);
+void gb_ilog_write(const struct gb_ilog_rec *r, void (*extra)(void *user, struct gb_json *j), void *user);
+void gb_ilog_close(void);
+/* One header line per log file and configuration:
+ * {"header":"pipeline","pid","test","params","mode","pipeline":<json>}. */
+void gb_ilog_header(const char *pipeline_json);
+/* Adds "diagnostic":[...] to a result when a diagnostic flag changed the
+ * measurement (interval-log on Vulkan, check-each, count). */
+void gb_result_diagnostic(struct gb_result *r, bool ilog_changes_timing);
 
 /* ---- one measured pass of a submission stream ---- */
 struct gb_pass {

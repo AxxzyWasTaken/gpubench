@@ -4,6 +4,7 @@
  * result lines (gb_common). See suite/README.md. */
 #import <Foundation/Foundation.h>
 #import <Metal/Metal.h>
+#include <mach/mach_time.h>
 #include <pthread.h>
 #include <stdlib.h>
 #include <string.h>
@@ -156,6 +157,21 @@ print_info(void)
 
 typedef void (^GBEncode)(id<MTLCommandBuffer> cb, uint64_t k);
 typedef void (^GBDone)(uint64_t k);
+/* Optional variants with the ring slot (per-slot resources, --check-each). */
+typedef void (^GBEncodeSlot)(id<MTLCommandBuffer> cb, uint64_t k, int slot);
+typedef void (^GBDoneSlot)(uint64_t k, int slot);
+/* Extra fields of the --interval-log line of the submission just completed. */
+typedef void (^GBIlogExtra)(struct gb_json *j);
+
+/* Seconds on the host clock GPUStartTime/GPUEndTime use (mach_absolute_time). */
+static double
+host_seconds(void)
+{
+   static mach_timebase_info_data_t tb;
+   if (!tb.denom)
+      mach_timebase_info(&tb);
+   return (double)mach_absolute_time() * tb.numer / tb.denom / 1e9;
+}
 
 @interface GBStream : NSObject
 @property(nonatomic, strong) id<MTLCommandQueue> queue;
@@ -166,6 +182,13 @@ typedef void (^GBDone)(uint64_t k);
 @property(nonatomic) uint64_t value;
 @property(nonatomic) BOOL failed;
 @property(nonatomic) uint64_t *submit_ns;
+@property(nonatomic) double *submit_host;
+@property(nonatomic, copy) GBEncodeSlot encodeSlot; /* used instead of encode when set */
+@property(nonatomic, copy) GBDoneSlot doneSlot;     /* called instead of done when set */
+@property(nonatomic, copy) GBIlogExtra ilogExtra;
+@property(nonatomic) BOOL ilog;                     /* --interval-log */
+@property(nonatomic) long count;                    /* --count */
+@property(nonatomic) int passIndex;                 /* 0 untimed, 1 timed */
 @end
 
 @implementation GBStream
@@ -180,11 +203,14 @@ typedef void (^GBDone)(uint64_t k);
    for (int i = 0; i < d; i++)
       [_cbs addObject:[NSNull null]];
    _submit_ns = calloc(d, sizeof(uint64_t));
+   _submit_host = calloc(d, sizeof(double));
+   _ilog = gb_ilog_enabled();
    return self;
 }
 - (void)dealloc
 {
    free(_submit_ns);
+   free(_submit_host);
 }
 @end
 
@@ -204,6 +230,55 @@ new_cb(id<MTLCommandQueue> q)
    return [q commandBufferWithUnretainedReferences];
 }
 
+static void
+stream_encode(GBStream *s, id<MTLCommandBuffer> cb, uint64_t k, int slot)
+{
+   if (s.encodeSlot)
+      s.encodeSlot(cb, k, slot);
+   else
+      s.encode(cb, k);
+}
+
+static void
+stream_done(GBStream *s, uint64_t k, int slot)
+{
+   if (s.doneSlot)
+      s.doneSlot(k, slot);
+   else if (s.done)
+      s.done(k);
+}
+
+static void
+ilog_extra_tramp(void *user, struct gb_json *j)
+{
+   GBIlogExtra x = (__bridge GBIlogExtra)user;
+   x(j);
+}
+
+static void
+stream_ilog(GBStream *s, id<MTLCommandBuffer> cb, uint64_t iter, int slot, bool measured, double host_done)
+{
+   struct gb_ilog_rec rec = {
+      .iter = iter,
+      .slot = slot,
+      .ring = s.depth,
+      .pass = s.passIndex,
+      .measured = measured,
+      .have_gpu = cb.GPUEndTime > 0,
+      .gpu_start = cb.GPUStartTime,
+      .gpu_end = cb.GPUEndTime,
+      .host_submit = s.submit_host[slot],
+      .host_done = host_done,
+      .clock = "mach_host",
+      .host_clock = "mach_host",
+   };
+   GBIlogExtra x = s.ilogExtra;
+   if (x)
+      gb_ilog_write(&rec, ilog_extra_tramp, (__bridge void *)x);
+   else
+      gb_ilog_write(&rec, NULL, NULL);
+}
+
 static double
 stream_once(GBStream *s)
 {
@@ -211,7 +286,7 @@ stream_once(GBStream *s)
    double us;
    @autoreleasepool {
       id<MTLCommandBuffer> cb = new_cb(s.queue);
-      s.encode(cb, v);
+      stream_encode(s, cb, v, 0);
       uint64_t t0 = gb_now_ns();
       [cb commit];
       [cb waitUntilCompleted];
@@ -221,8 +296,7 @@ stream_once(GBStream *s)
       us = (t1 - t0) / 1e3;
    }
    s.value = v;
-   if (s.done)
-      s.done(v);
+   stream_done(s, v, 0);
    return us;
 }
 
@@ -230,38 +304,50 @@ static int
 stream_run(GBStream *s, bool timed, uint64_t t0, uint64_t warmup_ns, int nwin, uint64_t win_ns, struct gb_pass *out)
 {
    memset(out, 0, sizeof(*out));
+   /* --count N: one window holding exactly N measured submissions, from the
+    * first measured submission to the last completion (as gb_vk.c). */
+   const bool counted = s.count > 0;
+   if (counted)
+      nwin = 1;
    out->nwin = nwin;
    out->win_s = win_ns / 1e9;
    out->timed = timed;
    const uint64_t tm0 = t0 + warmup_ns, t_end = tm0 + (uint64_t)nwin * win_ns;
    const uint64_t base = s.value;
    const int depth = s.depth;
+   const long count = s.count;
+   const BOOL ilog = s.ilog;
    uint64_t k = 0, done = 0;
+   uint64_t mk0 = UINT64_MAX, t_first = 0, t_last = 0;
    double last_end = 0;
    bool have_last = false;
    NSMutableArray *cbs = s.cbs;
    uint64_t *submit_ns = s.submit_ns;
+   double *submit_host = s.submit_host;
 
    gb_sleep_until_ns(t0);
    for (;;) {
       @autoreleasepool {
          uint64_t now = gb_now_ns();
          bool full = k - done >= (uint64_t)depth;
-         if (!full && now >= t_end)
+         bool more = counted ? mk0 == UINT64_MAX || k - mk0 < (uint64_t)count : now < t_end;
+         if (!more && (counted ? done == k : !full))
             break;
-         if (full) {
+         if (full || !more) {
             int slot = done % depth;
             id<MTLCommandBuffer> cb = cbs[slot];
             [cb waitUntilCompleted];
             uint64_t t = gb_now_ns();
+            double th = ilog ? host_seconds() : 0;
             if (!cb_ok(cb)) {
                s.failed = YES;
                break;
             }
-            bool measured = t >= tm0 && t < t_end;
+            bool measured = counted ? mk0 != UINT64_MAX && done >= mk0 : t >= tm0 && t < t_end;
             if (measured) {
-               out->win_count[(t - tm0) / win_ns]++;
+               out->win_count[counted ? 0 : (t - tm0) / win_ns]++;
                gb_samples_push(&out->latency, (t - submit_ns[slot]) / 1e3);
+               t_last = t;
             }
             if (timed) {
                double a = cb.GPUStartTime, b = cb.GPUEndTime;
@@ -273,22 +359,29 @@ stream_run(GBStream *s, bool timed, uint64_t t0, uint64_t warmup_ns, int nwin, u
                last_end = b;
                have_last = true;
             }
+            stream_done(s, base + done + 1, slot);
+            if (ilog)
+               stream_ilog(s, cb, base + done + 1, slot, measured, th);
             cbs[slot] = [NSNull null];
-            if (s.done)
-               s.done(base + done + 1);
             done++;
             continue;
          }
          int slot = k % depth;
          uint64_t r0 = gb_now_ns();
+         if (counted && mk0 == UINT64_MAX && r0 >= tm0) {
+            mk0 = k;
+            t_first = r0;
+         }
          id<MTLCommandBuffer> cb = new_cb(s.queue);
-         s.encode(cb, base + k + 1);
+         stream_encode(s, cb, base + k + 1, slot);
          uint64_t r1 = gb_now_ns();
          submit_ns[slot] = r1;
+         if (ilog)
+            submit_host[slot] = host_seconds();
          [cb commit];
          uint64_t r2 = gb_now_ns();
          cbs[slot] = cb;
-         if (r0 >= tm0 && r0 < t_end) {
+         if (counted ? mk0 != UINT64_MAX : r0 >= tm0 && r0 < t_end) {
             gb_samples_push(&out->record_cpu, (r1 - r0) / 1e3);
             gb_samples_push(&out->submit_cpu, (r2 - r1) / 1e3);
          }
@@ -298,15 +391,20 @@ stream_run(GBStream *s, bool timed, uint64_t t0, uint64_t warmup_ns, int nwin, u
    /* drain (not counted) */
    for (; done < k; done++) {
       @autoreleasepool {
-         id<MTLCommandBuffer> cb = cbs[done % depth];
+         int slot = done % depth;
+         id<MTLCommandBuffer> cb = cbs[slot];
          if ([cb isKindOfClass:[NSNull class]])
             continue;
          [cb waitUntilCompleted];
-         cbs[done % depth] = [NSNull null];
-         if (s.done)
-            s.done(base + done + 1);
+         double th = ilog ? host_seconds() : 0;
+         stream_done(s, base + done + 1, slot);
+         if (ilog && cb_ok(cb))
+            stream_ilog(s, cb, base + done + 1, slot, false, th);
+         cbs[slot] = [NSNull null];
       }
    }
+   if (counted && t_last > t_first)
+      out->win_s = (t_last - t_first) / 1e9;
    s.value = base + k;
    for (int i = 0; i < nwin; i++)
       out->submits += out->win_count[i];
@@ -325,12 +423,23 @@ struct mtest {
    id (*setup)(const struct gb_opts *o, char *err, size_t n);
    void (*encode)(id state, id<MTLCommandBuffer> cb, uint64_t k);
    void (*derive)(const struct gb_opts *o, struct gb_result *r, const struct gb_samples *us);
+   /* Optional hooks, as struct gb_stream_test in gb_vk.h. */
+   void (*encode_slot)(id state, id<MTLCommandBuffer> cb, uint64_t k, int slot);
+   void (*done_slot)(id state, uint64_t k, int slot);
+   void (*ilog_extra)(id state, struct gb_json *j);
+   void (*check)(id state, struct gb_check *out);
+   void (*check_each_totals)(id state, struct gb_check *out);
+   void (*check_each_reset)(id state);
+   bool probe_procs;
+   char *(*row_info)(id state); /* malloc'ed JSON object or NULL */
 };
 
 static GBEncode
 make_encode(const struct mtest *t, id st)
 {
    void (*fn)(id, id<MTLCommandBuffer>, uint64_t) = t->encode;
+   if (!fn)
+      return nil; /* the test encodes through encode_slot */
    return ^(id<MTLCommandBuffer> cb, uint64_t k) { fn(st, cb, k); };
 }
 
@@ -380,13 +489,22 @@ run_threads(NSArray *streams, bool timed, uint64_t warm, int nwin, uint64_t win,
    free(t);
 }
 
+struct checks {
+   struct gb_check end, each;
+};
+
 static void
 finish_result(const struct gb_opts *o, const struct mtest *t, enum gb_mode mode, int depth, struct gb_pass *u,
-              struct gb_pass *ti, double first_us, int units)
+              struct gb_pass *ti, double first_us, int units, const struct checks *c, const char *pinfo)
 {
    struct gb_result r;
    gb_result_begin(&r, o, mode, depth, NULL);
    gb_result_run_info(&r, o->warmup_ms, o->runs, o->run_ms);
+   if (pinfo)
+      gb_json_raw(&r.j, "pipeline", pinfo);
+   /* GPUStartTime/GPUEndTime cost nothing extra: the interval log does not
+    * change what the untimed pass measures here. */
+   gb_result_diagnostic(&r, false);
    if (u->failed || (ti && ti->failed)) {
       gb_result_finish(&r, "fail", NULL, "command buffer error");
       return;
@@ -410,7 +528,52 @@ finish_result(const struct gb_opts *o, const struct mtest *t, enum gb_mode mode,
    if (mode != GB_MODE_QUEUE)
       gb_json_int(&r.j, mode == GB_MODE_PROCS ? "procs" : "queues", units);
    gb_json_obj_end(&r.j);
-   gb_result_finish(&r, "ok", "us_per_submit", NULL);
+   bool bad = false;
+   if (o->check && c) {
+      gb_result_check(&r, &c->end, false);
+      bad |= c->end.checked && !c->end.pass;
+   }
+   if (o->check_each && c) {
+      gb_result_check(&r, &c->each, true);
+      bad |= c->each.checked && !c->each.pass;
+   }
+   gb_result_finish(&r, bad ? "fail" : "ok", "us_per_submit", bad ? "render check failed (see check_* fields)" : NULL);
+}
+
+static GBStream *
+new_stream(const struct gb_opts *o, const struct mtest *t, id st, int depth)
+{
+   GBStream *s = [[GBStream alloc] initWithQueue:new_queue(depth) depth:depth encode:make_encode(t, st) done:nil];
+   void (*es)(id, id<MTLCommandBuffer>, uint64_t, int) = t->encode_slot;
+   void (*ds)(id, uint64_t, int) = t->done_slot;
+   void (*ix)(id, struct gb_json *) = t->ilog_extra;
+   if (es)
+      s.encodeSlot = ^(id<MTLCommandBuffer> cb, uint64_t k, int slot) { es(st, cb, k, slot); };
+   if (ds)
+      s.doneSlot = ^(uint64_t k, int slot) { ds(st, k, slot); };
+   if (ix)
+      s.ilogExtra = ^(struct gb_json *j) { ix(st, j); };
+   s.count = o->count;
+   return s;
+}
+
+/* After the timed pass, with the stream idle. */
+static void
+collect_checks(const struct gb_opts *o, const struct mtest *t, id st, struct checks *c)
+{
+   memset(c, 0, sizeof(*c));
+   if (o->check) {
+      if (t->check)
+         t->check(st, &c->end);
+      else
+         snprintf(c->end.note, sizeof(c->end.note), "--check is not supported by %s", t->name);
+   }
+   if (o->check_each) {
+      if (t->check_each_totals)
+         t->check_each_totals(st, &c->each);
+      else
+         snprintf(c->each.note, sizeof(c->each.note), "--check-each is not supported by %s", t->name);
+   }
 }
 
 static int
@@ -423,10 +586,22 @@ run_child(const struct gb_opts *o, const struct mtest *t)
       gb_log("child setup failed: %s", err);
       return 1;
    }
-   GBStream *s = [[GBStream alloc] initWithQueue:new_queue(1) depth:1 encode:make_encode(t, st) done:nil];
+   gb_ilog_setup(o);
+   if (gb_ilog_enabled() && t->row_info) {
+      char *pinfo = t->row_info(st);
+      gb_ilog_header(pinfo);
+      free(pinfo);
+   }
+   GBStream *s = new_stream(o, t, st, 1);
    struct gb_pass prime;
+   s.ilog = NO;
+   s.count = 0;
    stream_run(s, false, gb_now_ns(), 0, 1, 30000000ull, &prime);
    gb_pass_free(&prime);
+   s.ilog = gb_ilog_enabled();
+   s.count = o->count;
+   if (t->check_each_reset)
+      t->check_each_reset(st);
    gb_child_ready();
    const uint64_t W = (uint64_t)o->warmup_ms * 1000000ull, R = (uint64_t)o->run_ms * 1000000ull;
    for (int pass = 0;; pass++) {
@@ -435,10 +610,18 @@ run_child(const struct gb_opts *o, const struct mtest *t)
          break;
       bool timed = pass == 1;
       struct gb_pass p;
+      s.passIndex = timed;
       stream_run(s, timed, t0, timed ? timed_warm(o) : W, timed ? o->timed_runs : o->runs, R, &p);
       gb_pass_put(1, &p);
       gb_pass_free(&p);
    }
+   struct checks c;
+   collect_checks(o, t, st, &c);
+   if (o->check)
+      gb_check_put(1, &c.end);
+   if (o->check_each)
+      gb_check_put(1, &c.each);
+   gb_ilog_close();
    return 0;
 }
 
@@ -457,6 +640,23 @@ run_stream_test(const struct gb_opts *o, const struct mtest *t)
    const bool do_timed = o->timestamps && !t->no_timed;
 
    if (o->mode == GB_MODE_PROCS) {
+      /* render.mesh: set up once in the parent first, so a configuration the
+       * device cannot run is a skip row rather than a child failure. */
+      char *pinfo = NULL;
+      if (t->probe_procs) {
+         ctx_init();
+         char err[256] = "";
+         @autoreleasepool {
+            id st = t->setup(o, err, sizeof(err));
+            if (!st) {
+               for (int i = 0; i < nd; i++)
+                  gb_result_simple(o, GB_MODE_PROCS, depths[i], NULL, "skip", err[0] ? err : "setup failed");
+               return 0;
+            }
+            if (t->row_info)
+               pinfo = t->row_info(st);
+         }
+      }
       for (int di = 0; di < nd; di++) {
          int n = depths[di];
          struct gb_child *ch = calloc(n, sizeof(*ch));
@@ -484,18 +684,38 @@ run_stream_test(const struct gb_opts *o, const struct mtest *t)
                gb_pass_free(&p);
             }
          }
-         for (int i = 0; i < n; i++) {
+         for (int i = 0; i < n; i++)
             gb_child_send_u64(&ch[i], 0);
-            gb_child_reap(&ch[i]);
+         /* Each child checks its own target; a child that cannot report fails the check. */
+         struct checks c = {0};
+         for (int i = 0; i < n; i++) {
+            struct gb_check e, x;
+            if (o->check) {
+               if (gb_check_get(ch[i].from_child, &e)) {
+                  e = (struct gb_check){.checked = 1, .pass = 0};
+                  bad = true;
+               }
+               gb_check_add(&c.end, &e);
+            }
+            if (o->check_each) {
+               if (gb_check_get(ch[i].from_child, &x)) {
+                  x = (struct gb_check){.checked = 1, .pass = 0};
+                  bad = true;
+               }
+               gb_check_add(&c.each, &x);
+            }
          }
+         for (int i = 0; i < n; i++)
+            gb_child_reap(&ch[i]);
          if (bad)
             u.failed = true;
-         finish_result(o, t, GB_MODE_PROCS, n, &u, do_timed ? &ti : NULL, -1, n);
+         finish_result(o, t, GB_MODE_PROCS, n, &u, do_timed ? &ti : NULL, -1, n, &c, pinfo);
          gb_pass_free(&u);
          gb_pass_free(&ti);
          free(ch);
       }
-      return 0;
+      free(pinfo);
+      return gb_check_failed ? 1 : 0;
    }
 
    ctx_init();
@@ -506,36 +726,47 @@ run_stream_test(const struct gb_opts *o, const struct mtest *t)
          gb_result_simple(o, o->mode, depths[i], NULL, "skip", err[0] ? err : "setup failed");
       return 0;
    }
-   GBEncode enc = make_encode(t, st);
+   gb_ilog_setup(o);
+   char *pinfo = t->row_info ? t->row_info(st) : NULL;
+   gb_ilog_header(pinfo);
    bool first = t->report_first;
    for (int di = 0; di < nd; di++) {
       @autoreleasepool {
          int n = depths[di];
          struct gb_pass u = {0}, ti = {0};
          double first_us = -1;
+         if (t->check_each_reset)
+            t->check_each_reset(st);
          if (o->mode == GB_MODE_QUEUE) {
-            GBStream *s = [[GBStream alloc] initWithQueue:new_queue(n) depth:n encode:enc done:nil];
+            GBStream *s = new_stream(o, t, st, n);
             if (first) {
                first_us = stream_once(s);
                first = false;
             }
             stream_run(s, false, gb_now_ns(), W, o->runs, R, &u);
+            s.passIndex = 1;
             if (do_timed && !s.failed)
                stream_run(s, true, gb_now_ns(), timed_warm(o), o->timed_runs, R, &ti);
          } else {
             NSMutableArray *ss = [NSMutableArray array];
             for (int i = 0; i < n; i++)
-               [ss addObject:[[GBStream alloc] initWithQueue:new_queue(1) depth:1 encode:enc done:nil]];
+               [ss addObject:new_stream(o, t, st, 1)];
             run_threads(ss, false, W, o->runs, R, &u);
+            for (GBStream *x in ss)
+               x.passIndex = 1;
             if (do_timed && !u.failed)
                run_threads(ss, true, timed_warm(o), o->timed_runs, R, &ti);
          }
-         finish_result(o, t, o->mode, n, &u, do_timed ? &ti : NULL, first_us, n);
+         struct checks c;
+         collect_checks(o, t, st, &c);
+         finish_result(o, t, o->mode, n, &u, do_timed ? &ti : NULL, first_us, n, &c, pinfo);
          gb_pass_free(&u);
          gb_pass_free(&ti);
       }
    }
-   return 0;
+   free(pinfo);
+   gb_ilog_close();
+   return gb_check_failed ? 1 : 0;
 }
 
 /* ======================= tests ======================= */
