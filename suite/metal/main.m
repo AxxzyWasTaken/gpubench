@@ -8,9 +8,11 @@
 #include <stdlib.h>
 #include <string.h>
 #include <sys/sysctl.h>
+#include <unistd.h>
 
 #include "gb_common.h"
 #include "gb_params.h"
+#include "gb_wave1_ref.h"
 #include "msl_sources.h"
 
 /* ======================= context ======================= */
@@ -325,6 +327,7 @@ struct mtest {
    id (*setup)(const struct gb_opts *o, char *err, size_t n);
    void (*encode)(id state, id<MTLCommandBuffer> cb, uint64_t k);
    void (*derive)(const struct gb_opts *o, struct gb_result *r, const struct gb_samples *us);
+   void (*check)(id state, struct gb_check *chk);
 };
 
 static GBEncode
@@ -382,7 +385,7 @@ run_threads(NSArray *streams, bool timed, uint64_t warm, int nwin, uint64_t win,
 
 static void
 finish_result(const struct gb_opts *o, const struct mtest *t, enum gb_mode mode, int depth, struct gb_pass *u,
-              struct gb_pass *ti, double first_us, int units)
+              struct gb_pass *ti, double first_us, int units, const struct gb_check *chk)
 {
    struct gb_result r;
    gb_result_begin(&r, o, mode, depth, NULL);
@@ -410,6 +413,13 @@ finish_result(const struct gb_opts *o, const struct mtest *t, enum gb_mode mode,
    if (mode != GB_MODE_QUEUE)
       gb_json_int(&r.j, mode == GB_MODE_PROCS ? "procs" : "queues", units);
    gb_json_obj_end(&r.j);
+   if (chk && chk->done) {
+      gb_result_check(&r, chk);
+      if (!chk->valid) {
+         gb_result_finish(&r, "fail", NULL, "output does not match the reference");
+         return;
+      }
+   }
    gb_result_finish(&r, "ok", "us_per_submit", NULL);
 }
 
@@ -427,6 +437,14 @@ run_child(const struct gb_opts *o, const struct mtest *t)
    struct gb_pass prime;
    stream_run(s, false, gb_now_ns(), 0, 1, 30000000ull, &prime);
    gb_pass_free(&prime);
+   if (t->check) {
+      struct gb_check chk = {0};
+      t->check(st, &chk);
+      if (chk.done && !chk.valid) {
+         gb_log("child output does not match the reference");
+         return 1;
+      }
+   }
    gb_child_ready();
    const uint64_t W = (uint64_t)o->warmup_ms * 1000000ull, R = (uint64_t)o->run_ms * 1000000ull;
    for (int pass = 0;; pass++) {
@@ -490,7 +508,7 @@ run_stream_test(const struct gb_opts *o, const struct mtest *t)
          }
          if (bad)
             u.failed = true;
-         finish_result(o, t, GB_MODE_PROCS, n, &u, do_timed ? &ti : NULL, -1, n);
+         finish_result(o, t, GB_MODE_PROCS, n, &u, do_timed ? &ti : NULL, -1, n, NULL);
          gb_pass_free(&u);
          gb_pass_free(&ti);
          free(ch);
@@ -530,7 +548,10 @@ run_stream_test(const struct gb_opts *o, const struct mtest *t)
             if (do_timed && !u.failed)
                run_threads(ss, true, timed_warm(o), o->timed_runs, R, &ti);
          }
-         finish_result(o, t, o->mode, n, &u, do_timed ? &ti : NULL, first_us, n);
+         struct gb_check chk = {0};
+         if (t->check && !u.failed && !ti.failed)
+            t->check(st, &chk);
+         finish_result(o, t, o->mode, n, &u, do_timed ? &ti : NULL, first_us, n, &chk);
          gb_pass_free(&u);
          gb_pass_free(&ti);
       }
@@ -1547,6 +1568,1454 @@ dump_archives(const char *dir)
    return bad ? 1 : 0;
 }
 
+/* ======================= 90%-coverage Wave-1 tests ======================= */
+
+static void
+mtl_buf_upload(id<MTLBuffer> dst, const void *src, size_t bytes)
+{
+   id<MTLBuffer> stg = buf(bytes, true);
+   memcpy(stg.contents, src, bytes);
+   id<MTLCommandQueue> q = [g_dev newCommandQueue];
+   id<MTLCommandBuffer> cb = [q commandBuffer];
+   id<MTLBlitCommandEncoder> b = [cb blitCommandEncoder];
+   [b copyFromBuffer:stg sourceOffset:0 toBuffer:dst destinationOffset:0 size:bytes];
+   [b endEncoding];
+   [cb commit];
+   [cb waitUntilCompleted];
+}
+
+static void
+mtl_buf_readback(id<MTLBuffer> src, void *dst, size_t bytes)
+{
+   id<MTLBuffer> stg = buf(bytes, true);
+   id<MTLCommandQueue> q = [g_dev newCommandQueue];
+   id<MTLCommandBuffer> cb = [q commandBuffer];
+   id<MTLBlitCommandEncoder> b = [cb blitCommandEncoder];
+   [b copyFromBuffer:src sourceOffset:0 toBuffer:stg destinationOffset:0 size:bytes];
+   [b endEncoding];
+   [cb commit];
+   [cb waitUntilCompleted];
+   memcpy(dst, stg.contents, bytes);
+}
+
+static void
+mtl_tex_readback(id<MTLTexture> src, void *dst, uint32_t w, uint32_t h, size_t bpp)
+{
+   size_t bytes = (size_t)w * h * bpp;
+   id<MTLBuffer> stg = buf(bytes, true);
+   id<MTLCommandQueue> q = [g_dev newCommandQueue];
+   id<MTLCommandBuffer> cb = [q commandBuffer];
+   id<MTLBlitCommandEncoder> b = [cb blitCommandEncoder];
+   [b copyFromTexture:src
+          sourceSlice:0
+          sourceLevel:0
+         sourceOrigin:MTLOriginMake(0, 0, 0)
+           sourceSize:MTLSizeMake(w, h, 1)
+             toBuffer:stg
+    destinationOffset:0
+ destinationBytesPerRow:w * bpp
+ destinationBytesPerImage:bytes];
+   [b endEncoding];
+   [cb commit];
+   [cb waitUntilCompleted];
+   memcpy(dst, stg.contents, bytes);
+}
+
+static id<MTLTexture>
+tex_ex(uint32_t w, uint32_t h, MTLPixelFormat fmt, NSUInteger samples, MTLStorageMode sm, MTLTextureUsage usage)
+{
+   MTLTextureDescriptor *d = [MTLTextureDescriptor texture2DDescriptorWithPixelFormat:fmt width:w height:h mipmapped:NO];
+   if (samples > 1) {
+      d.textureType = MTLTextureType2DMultisample;
+      d.sampleCount = samples;
+   }
+   d.storageMode = sm;
+   d.usage = usage;
+   d.hazardTrackingMode = MTLHazardTrackingModeUntracked;
+   id<MTLTexture> t = [g_dev newTextureWithDescriptor:d];
+   if (!t)
+      gb_die("texture %ux%u (samples=%lu) failed", w, h, (unsigned long)samples);
+   return t;
+}
+
+static id<MTLComputePipelineState>
+cpipe_const_u32(const char *fn, NSUInteger idx, uint32_t val)
+{
+   NSError *err = nil;
+   MTLFunctionConstantValues *fc = [MTLFunctionConstantValues new];
+   [fc setConstantValue:&val type:MTLDataTypeUInt atIndex:idx];
+   id<MTLFunction> f = [g_lib newFunctionWithName:[NSString stringWithUTF8String:fn] constantValues:fc error:&err];
+   if (!f)
+      gb_die("function %s const failed: %s", fn, err.localizedDescription.UTF8String);
+   id<MTLComputePipelineState> p = [g_dev newComputePipelineStateWithFunction:f error:&err];
+   if (!p)
+      gb_die("compute pipeline %s: %s", fn, err.localizedDescription.UTF8String);
+   return p;
+}
+
+/* ---- 1. compute.uber ---- */
+
+@interface GBUberState : NSObject
+@property(nonatomic) enum gb_uber_kind kind;
+@property(nonatomic, strong) id<MTLComputePipelineState> cp;
+@property(nonatomic, strong) id<MTLBuffer> inBuf, outBuf;
+@property(nonatomic) uint32_t *ref;
+@property(nonatomic) uint32_t refCrc;
+@end
+@implementation GBUberState
+- (void)dealloc { free(_ref); }
+@end
+
+static GBUberState *
+uber_make_state(enum gb_uber_kind kind)
+{
+   GBUberState *st = [GBUberState new];
+   st.kind = kind;
+   size_t out_bytes = (size_t)GB_UBER_THREADS * sizeof(uint32_t);
+   st.outBuf = buf(out_bytes, false);
+   uint32_t *ilp_cpu = NULL;
+   if (kind == GB_UBER_ILP) {
+      size_t in_bytes = (size_t)GB_UBER_ILP_WORDS * sizeof(uint32_t);
+      ilp_cpu = malloc(in_bytes);
+      gb_uber_fill_ilp_input(ilp_cpu, GB_UBER_ILP_WORDS);
+      st.inBuf = buf(in_bytes, false);
+      mtl_buf_upload(st.inBuf, ilp_cpu, in_bytes);
+      st.cp = cpipe("uber_ilp_main");
+   } else {
+      const char *fn = kind == GB_UBER_DIV ? "uber_div_main"
+                       : kind == GB_UBER_UNI ? "uber_uni_main" : "uber_sram_main";
+      st.cp = cpipe(fn);
+   }
+   st.ref = malloc(out_bytes);
+   st.refCrc = gb_uber_ref(kind, ilp_cpu, st.ref, GB_UBER_THREADS);
+   free(ilp_cpu);
+   return st;
+}
+
+static id
+uber_setup(const struct gb_opts *o, char *err, size_t n)
+{
+   const char *kind = gb_param(o, "kind", "divergent");
+   if (!strcmp(kind, "divergent")) return uber_make_state(GB_UBER_DIV);
+   if (!strcmp(kind, "uniform"))   return uber_make_state(GB_UBER_UNI);
+   if (!strcmp(kind, "ilp"))       return uber_make_state(GB_UBER_ILP);
+   snprintf(err, n, "kind must be divergent, uniform or ilp");
+   return nil;
+}
+
+static void
+uber_encode(id state, id<MTLCommandBuffer> cb, uint64_t k)
+{
+   (void)k;
+   GBUberState *st = state;
+   id<MTLComputeCommandEncoder> e = [cb computeCommandEncoder];
+   [e setComputePipelineState:st.cp];
+   struct { uint32_t a, b; } pc = {
+      GB_UBER_SEED,
+      st.kind == GB_UBER_ILP ? (GB_UBER_ILP_WORDS - 1u) : GB_UBER_ITERS,
+   };
+   if (st.kind == GB_UBER_ILP) {
+      [e setBuffer:st.inBuf offset:0 atIndex:0];
+      [e setBuffer:st.outBuf offset:0 atIndex:1];
+      [e setBytes:&pc length:sizeof(pc) atIndex:2];
+   } else {
+      [e setBuffer:st.outBuf offset:0 atIndex:0];
+      [e setBytes:&pc length:sizeof(pc) atIndex:1];
+   }
+   [e dispatchThreadgroups:MTLSizeMake(GB_UBER_GROUPS, 1, 1)
+     threadsPerThreadgroup:MTLSizeMake(GB_UBER_LOCAL, 1, 1)];
+   [e endEncoding];
+}
+
+static void
+uber_derive(const struct gb_opts *o, struct gb_result *r, const struct gb_samples *us)
+{
+   (void)o;
+   gb_derive_rate(r, "mthreads_s", "Mthreads/s", us, (double)GB_UBER_THREADS);
+}
+
+static void
+uber_check(id state, struct gb_check *chk)
+{
+   GBUberState *st = state;
+   uint32_t *got = malloc((size_t)GB_UBER_THREADS * sizeof(uint32_t));
+   mtl_buf_readback(st.outBuf, got, (size_t)GB_UBER_THREADS * sizeof(uint32_t));
+   gb_check_words(chk, got, st.ref, st.refCrc, GB_UBER_THREADS);
+   free(got);
+}
+
+static const char *const uber_params[] = {"kind", NULL};
+static const struct mtest t_compute_uber = {
+   .name = "compute.uber", .known = uber_params, .depths = {1, 4}, .nd = 2,
+   .setup = uber_setup, .encode = uber_encode, .derive = uber_derive, .check = uber_check,
+};
+
+/* ---- 2. compute.conv2d ---- */
+
+@interface GBConvState : NSObject
+@property(nonatomic) uint32_t w, h;
+@property(nonatomic, strong) id<MTLComputePipelineState> ph, pv;
+@property(nonatomic, strong) id<MTLBuffer> inBuf, midBuf, outBuf;
+@property(nonatomic) uint32_t *ref;
+@property(nonatomic) uint32_t refCrc;
+@end
+@implementation GBConvState
+- (void)dealloc { free(_ref); }
+@end
+
+static id
+conv_setup(const struct gb_opts *o, char *err, size_t n)
+{
+   const char *kind = gb_param(o, "kind", "gaussian");
+   bool bilateral = !strcmp(kind, "bilateral");
+   if (!bilateral && strcmp(kind, "gaussian")) {
+      snprintf(err, n, "kind must be gaussian or bilateral");
+      return nil;
+   }
+   uint32_t w = 0, h = 0;
+   if (!parse_res(gb_param(o, "res", "1080p"), &w, &h)) {
+      snprintf(err, n, "res must be 720p, 1080p, 1440p or 2160p");
+      return nil;
+   }
+   GBConvState *st = [GBConvState new];
+   st.w = w; st.h = h;
+   size_t bytes = (size_t)w * h * sizeof(uint32_t);
+   uint32_t *in_cpu = malloc(bytes);
+   gb_conv2d_fill_input(in_cpu, w, h);
+   st.ref = malloc(bytes);
+   st.refCrc = gb_conv2d_ref(bilateral, in_cpu, st.ref, w, h);
+   st.inBuf = buf(bytes, false);
+   st.midBuf = buf(bytes, false);
+   st.outBuf = buf(bytes, false);
+   mtl_buf_upload(st.inBuf, in_cpu, bytes);
+   free(in_cpu);
+   st.ph = cpipe_const_u32("conv2d_h_main", 10, bilateral ? 1u : 0u);
+   st.pv = cpipe_const_u32("conv2d_v_main", 10, bilateral ? 1u : 0u);
+   return st;
+}
+
+static void
+conv_encode(id state, id<MTLCommandBuffer> cb, uint64_t k)
+{
+   (void)k;
+   GBConvState *st = state;
+   struct { int32_t w, h; } pc = {(int32_t)st.w, (int32_t)st.h};
+   MTLSize tg = MTLSizeMake((st.w + GB_CONV_LOCAL - 1u) / GB_CONV_LOCAL,
+                            (st.h + GB_CONV_LOCAL - 1u) / GB_CONV_LOCAL, 1);
+   MTLSize loc = MTLSizeMake(GB_CONV_LOCAL, GB_CONV_LOCAL, 1);
+
+   id<MTLComputeCommandEncoder> e = [cb computeCommandEncoder];
+   [e setComputePipelineState:st.ph];
+   [e setBuffer:st.inBuf offset:0 atIndex:0];
+   [e setBuffer:st.midBuf offset:0 atIndex:1];
+   [e setBytes:&pc length:sizeof(pc) atIndex:2];
+   [e dispatchThreadgroups:tg threadsPerThreadgroup:loc];
+   [e memoryBarrierWithScope:MTLBarrierScopeBuffers];
+   [e setComputePipelineState:st.pv];
+   [e setBuffer:st.midBuf offset:0 atIndex:0];
+   [e setBuffer:st.outBuf offset:0 atIndex:1];
+   [e setBytes:&pc length:sizeof(pc) atIndex:2];
+   [e dispatchThreadgroups:tg threadsPerThreadgroup:loc];
+   [e endEncoding];
+}
+
+static void
+conv_derive(const struct gb_opts *o, struct gb_result *r, const struct gb_samples *us)
+{
+   uint32_t w = 1920, h = 1080;
+   parse_res(gb_param(o, "res", "1080p"), &w, &h);
+   gb_derive_rate(r, "mpix_s", "Mpix/s", us, (double)w * h);
+}
+
+static void
+conv_check(id state, struct gb_check *chk)
+{
+   GBConvState *st = state;
+   size_t count = (size_t)st.w * st.h;
+   uint32_t *got = malloc(count * sizeof(uint32_t));
+   mtl_buf_readback(st.outBuf, got, count * sizeof(uint32_t));
+   gb_check_words(chk, got, st.ref, st.refCrc, count);
+   free(got);
+}
+
+static const char *const conv_params[] = {"kind", "res", NULL};
+static const struct mtest t_compute_conv2d = {
+   .name = "compute.conv2d", .known = conv_params, .depths = {1, 4}, .nd = 2,
+   .setup = conv_setup, .encode = conv_encode, .derive = conv_derive, .check = conv_check,
+};
+
+/* ---- 3. compute.stereo ---- */
+
+@interface GBStereoState : NSObject
+@property(nonatomic) uint32_t disp;
+@property(nonatomic, strong) id<MTLComputePipelineState> cp;
+@property(nonatomic, strong) id<MTLBuffer> leftBuf, rightBuf, outBuf;
+@property(nonatomic) uint32_t *ref;
+@property(nonatomic) uint32_t refCrc;
+@end
+@implementation GBStereoState
+- (void)dealloc { free(_ref); }
+@end
+
+static id
+stereo_setup(const struct gb_opts *o, char *err, size_t n)
+{
+   long disp = gb_param_int(o, "disp", 64);
+   if (disp < 8 || disp > 128) {
+      snprintf(err, n, "disp must be 8..128");
+      return nil;
+   }
+   GBStereoState *st = [GBStereoState new];
+   st.disp = (uint32_t)disp;
+   size_t in_bytes = (size_t)GB_STEREO_PITCH * GB_STEREO_H;
+   size_t out_words = (size_t)GB_STEREO_PITCH * GB_STEREO_H;
+   size_t out_bytes = out_words * sizeof(uint32_t);
+   uint32_t *l_cpu = calloc(1, in_bytes);
+   uint32_t *r_cpu = calloc(1, in_bytes);
+   gb_stereo_fill_inputs(l_cpu, r_cpu, st.disp);
+   st.ref = calloc(out_words, sizeof(uint32_t));
+   st.refCrc = gb_stereo_ref(l_cpu, r_cpu, st.disp, st.ref);
+
+   st.leftBuf = buf(in_bytes, false);
+   st.rightBuf = buf(in_bytes, false);
+   st.outBuf = buf(out_bytes, false);
+   mtl_buf_upload(st.leftBuf, l_cpu, in_bytes);
+   mtl_buf_upload(st.rightBuf, r_cpu, in_bytes);
+   free(l_cpu);
+   free(r_cpu);
+
+   /* Zero output padding columns once so CRC matches CPU reference. */
+   id<MTLCommandQueue> q = [g_dev newCommandQueue];
+   id<MTLCommandBuffer> cb = [q commandBuffer];
+   id<MTLBlitCommandEncoder> b = [cb blitCommandEncoder];
+   [b fillBuffer:st.outBuf range:NSMakeRange(0, out_bytes) value:0];
+   [b endEncoding];
+   [cb commit];
+   [cb waitUntilCompleted];
+
+   st.cp = cpipe("stereo_main");
+   return st;
+}
+
+static void
+stereo_encode(id state, id<MTLCommandBuffer> cb, uint64_t k)
+{
+   (void)k;
+   GBStereoState *st = state;
+   struct { int32_t w, h, pitch, disp; } pc = {
+      (int32_t)GB_STEREO_W, (int32_t)GB_STEREO_H, (int32_t)GB_STEREO_PITCH, (int32_t)st.disp
+   };
+   id<MTLComputeCommandEncoder> e = [cb computeCommandEncoder];
+   [e setComputePipelineState:st.cp];
+   [e setBuffer:st.leftBuf offset:0 atIndex:0];
+   [e setBuffer:st.rightBuf offset:0 atIndex:1];
+   [e setBuffer:st.outBuf offset:0 atIndex:2];
+   [e setBytes:&pc length:sizeof(pc) atIndex:3];
+   [e dispatchThreadgroups:MTLSizeMake((GB_STEREO_W + GB_STEREO_LOCAL - 1u) / GB_STEREO_LOCAL,
+                                       (GB_STEREO_H + GB_STEREO_LOCAL - 1u) / GB_STEREO_LOCAL, 1)
+     threadsPerThreadgroup:MTLSizeMake(GB_STEREO_LOCAL, GB_STEREO_LOCAL, 1)];
+   [e endEncoding];
+}
+
+static void
+stereo_derive(const struct gb_opts *o, struct gb_result *r, const struct gb_samples *us)
+{
+   long disp = gb_param_int(o, "disp", 64);
+   gb_derive_rate(r, "mde_s", "Mdisp/s", us, (double)GB_STEREO_W * GB_STEREO_H * (double)disp);
+}
+
+static void
+stereo_check(id state, struct gb_check *chk)
+{
+   GBStereoState *st = state;
+   size_t count = (size_t)GB_STEREO_PITCH * GB_STEREO_H;
+   uint32_t *got = malloc(count * sizeof(uint32_t));
+   mtl_buf_readback(st.outBuf, got, count * sizeof(uint32_t));
+   gb_check_words(chk, got, st.ref, st.refCrc, count);
+   free(got);
+}
+
+static const char *const stereo_params[] = {"disp", NULL};
+static const struct mtest t_compute_stereo = {
+   .name = "compute.stereo", .known = stereo_params, .depths = {1, 2}, .nd = 2,
+   .setup = stereo_setup, .encode = stereo_encode, .derive = stereo_derive, .check = stereo_check,
+};
+
+/* ---- 4. compute.edge ---- */
+
+@interface GBEdgeState : NSObject
+@property(nonatomic) uint32_t w, h;
+@property(nonatomic) BOOL harris;
+@property(nonatomic, strong) id<MTLComputePipelineState> p1, p2, p3;
+@property(nonatomic, strong) id<MTLBuffer> inBuf, gradBuf, magBuf, respBuf, outBuf, cntBuf;
+@property(nonatomic) uint32_t *ref;
+@property(nonatomic) uint32_t refCrc, refCorners;
+@end
+@implementation GBEdgeState
+- (void)dealloc { free(_ref); }
+@end
+
+static id
+edge_setup(const struct gb_opts *o, char *err, size_t n)
+{
+   const char *kind = gb_param(o, "kind", "sobel");
+   bool harris = !strcmp(kind, "harris");
+   if (!harris && strcmp(kind, "sobel")) {
+      snprintf(err, n, "kind must be sobel or harris");
+      return nil;
+   }
+   uint32_t w = 0, h = 0;
+   if (!parse_res(gb_param(o, "res", "1080p"), &w, &h)) {
+      snprintf(err, n, "res must be 720p, 1080p, 1440p or 2160p");
+      return nil;
+   }
+   GBEdgeState *st = [GBEdgeState new];
+   st.w = w; st.h = h; st.harris = harris;
+   size_t bytes = (size_t)w * h * sizeof(uint32_t);
+   uint32_t *in_cpu = malloc(bytes);
+   gb_edge_fill_input(in_cpu, w, h);
+   st.ref = malloc(bytes);
+   uint32_t ref_corners = 0;
+   st.refCrc = gb_edge_ref(harris, in_cpu, st.ref, &ref_corners, w, h);
+   st.refCorners = ref_corners;
+
+   st.inBuf = buf(bytes, false);
+   st.gradBuf = buf(bytes, false);
+   st.magBuf = buf(bytes, false);
+   st.outBuf = buf(bytes, false);
+   mtl_buf_upload(st.inBuf, in_cpu, bytes);
+   free(in_cpu);
+
+   st.p1 = cpipe("edge_sobel_main");
+   if (!harris) {
+      st.p2 = cpipe("edge_nms_main");
+   } else {
+      st.respBuf = buf(bytes, false);
+      st.cntBuf = buf(64, false);
+      st.p2 = cpipe("edge_harris_resp_main");
+      st.p3 = cpipe("edge_harris_nms_main");
+   }
+   return st;
+}
+
+static void
+edge_encode(id state, id<MTLCommandBuffer> cb, uint64_t k)
+{
+   (void)k;
+   GBEdgeState *st = state;
+   struct { int32_t w, h; } pc = {(int32_t)st.w, (int32_t)st.h};
+   MTLSize tg = MTLSizeMake((st.w + GB_EDGE_LOCAL - 1u) / GB_EDGE_LOCAL,
+                            (st.h + GB_EDGE_LOCAL - 1u) / GB_EDGE_LOCAL, 1);
+   MTLSize loc = MTLSizeMake(GB_EDGE_LOCAL, GB_EDGE_LOCAL, 1);
+
+   if (st.harris) {
+      id<MTLBlitCommandEncoder> b = [cb blitCommandEncoder];
+      [b fillBuffer:st.cntBuf range:NSMakeRange(0, 4) value:0];
+      [b endEncoding];
+   }
+   id<MTLComputeCommandEncoder> e = [cb computeCommandEncoder];
+   [e setComputePipelineState:st.p1];
+   [e setBuffer:st.inBuf offset:0 atIndex:0];
+   [e setBuffer:st.gradBuf offset:0 atIndex:1];
+   [e setBuffer:st.magBuf offset:0 atIndex:2];
+   [e setBytes:&pc length:sizeof(pc) atIndex:3];
+   [e dispatchThreadgroups:tg threadsPerThreadgroup:loc];
+   [e memoryBarrierWithScope:MTLBarrierScopeBuffers];
+
+   if (!st.harris) {
+      [e setComputePipelineState:st.p2];
+      [e setBuffer:st.gradBuf offset:0 atIndex:0];
+      [e setBuffer:st.magBuf offset:0 atIndex:1];
+      [e setBuffer:st.outBuf offset:0 atIndex:2];
+      [e setBytes:&pc length:sizeof(pc) atIndex:3];
+      [e dispatchThreadgroups:tg threadsPerThreadgroup:loc];
+   } else {
+      [e setComputePipelineState:st.p2];
+      [e setBuffer:st.gradBuf offset:0 atIndex:0];
+      [e setBuffer:st.respBuf offset:0 atIndex:1];
+      [e setBytes:&pc length:sizeof(pc) atIndex:2];
+      [e dispatchThreadgroups:tg threadsPerThreadgroup:loc];
+      [e memoryBarrierWithScope:MTLBarrierScopeBuffers];
+      [e setComputePipelineState:st.p3];
+      [e setBuffer:st.respBuf offset:0 atIndex:0];
+      [e setBuffer:st.outBuf offset:0 atIndex:1];
+      [e setBuffer:st.cntBuf offset:0 atIndex:2];
+      [e setBytes:&pc length:sizeof(pc) atIndex:3];
+      [e dispatchThreadgroups:tg threadsPerThreadgroup:loc];
+   }
+   [e endEncoding];
+}
+
+static void
+edge_derive(const struct gb_opts *o, struct gb_result *r, const struct gb_samples *us)
+{
+   uint32_t w = 1920, h = 1080;
+   parse_res(gb_param(o, "res", "1080p"), &w, &h);
+   gb_derive_rate(r, "mpix_s", "Mpix/s", us, (double)w * h);
+}
+
+static void
+edge_check(id state, struct gb_check *chk)
+{
+   GBEdgeState *st = state;
+   size_t count = (size_t)st.w * st.h;
+   uint32_t *got = malloc(count * sizeof(uint32_t));
+   mtl_buf_readback(st.outBuf, got, count * sizeof(uint32_t));
+   gb_check_words(chk, got, st.ref, st.refCrc, count);
+   free(got);
+   if (st.harris && chk->valid) {
+      uint32_t cnt = 0;
+      mtl_buf_readback(st.cntBuf, &cnt, sizeof(cnt));
+      if (cnt != st.refCorners) {
+         gb_log("harris corner count mismatch: got %u want %u", cnt, st.refCorners);
+         chk->valid = false;
+      }
+   }
+}
+
+static const char *const edge_params[] = {"kind", "res", NULL};
+static const struct mtest t_compute_edge = {
+   .name = "compute.edge", .known = edge_params, .depths = {1, 4}, .nd = 2,
+   .setup = edge_setup, .encode = edge_encode, .derive = edge_derive, .check = edge_check,
+};
+
+/* ---- 5. render.deferred ---- */
+
+@interface GBDeferredState : NSObject
+@property(nonatomic) uint32_t w, h, msaa;
+@property(nonatomic) BOOL tile;
+@property(nonatomic, strong) id<MTLTexture> g0, g1, g2, g3, depthTex, finalTex, finalMs;
+@property(nonatomic, strong) id<MTLRenderPipelineState> pGeom, pLight;
+@property(nonatomic, strong) id<MTLDepthStencilState> dsLess, dsNone;
+@end
+@implementation GBDeferredState
+@end
+
+static GBDeferredState *
+deferred_make_state(uint32_t w, uint32_t h, uint32_t msaa, bool tile)
+{
+   GBDeferredState *st = [GBDeferredState new];
+   st.w = w; st.h = h; st.msaa = msaa; st.tile = tile;
+   MTLStorageMode gsm = tile ? MTLStorageModeMemoryless : MTLStorageModePrivate;
+   MTLTextureUsage gusage = tile ? MTLTextureUsageRenderTarget
+                                 : (MTLTextureUsageRenderTarget | MTLTextureUsageShaderRead);
+   st.g0 = tex_ex(w, h, MTLPixelFormatRGBA8Unorm, msaa, gsm, gusage);
+   st.g1 = tex_ex(w, h, MTLPixelFormatRGBA16Float, msaa, gsm, gusage);
+   st.g2 = tex_ex(w, h, MTLPixelFormatRGBA8Unorm, msaa, gsm, gusage);
+   st.g3 = tex_ex(w, h, MTLPixelFormatR32Float, msaa, gsm, gusage);
+   st.depthTex = tex_ex(w, h, MTLPixelFormatDepth32Float, msaa, MTLStorageModeMemoryless, MTLTextureUsageRenderTarget);
+   st.finalTex = tex_ex(w, h, MTLPixelFormatRGBA8Unorm, 1, MTLStorageModePrivate,
+                        MTLTextureUsageRenderTarget | MTLTextureUsageShaderRead);
+   if (tile && msaa == 4u)
+      st.finalMs = tex_ex(w, h, MTLPixelFormatRGBA8Unorm, msaa, MTLStorageModeMemoryless, MTLTextureUsageRenderTarget);
+
+   MTLDepthStencilDescriptor *dsd = [MTLDepthStencilDescriptor new];
+   dsd.depthCompareFunction = MTLCompareFunctionLess;
+   dsd.depthWriteEnabled = YES;
+   st.dsLess = [g_dev newDepthStencilStateWithDescriptor:dsd];
+   dsd.depthCompareFunction = MTLCompareFunctionAlways;
+   dsd.depthWriteEnabled = NO;
+   st.dsNone = [g_dev newDepthStencilStateWithDescriptor:dsd];
+
+   NSError *err = nil;
+   MTLRenderPipelineDescriptor *gd = [MTLRenderPipelineDescriptor new];
+   gd.vertexFunction = [g_lib newFunctionWithName:@"deferred_geom_vert"];
+   gd.fragmentFunction = [g_lib newFunctionWithName:@"deferred_geom_frag"];
+   gd.rasterSampleCount = msaa;
+   gd.colorAttachments[0].pixelFormat = MTLPixelFormatRGBA8Unorm;
+   gd.colorAttachments[1].pixelFormat = MTLPixelFormatRGBA16Float;
+   gd.colorAttachments[2].pixelFormat = MTLPixelFormatRGBA8Unorm;
+   gd.colorAttachments[3].pixelFormat = MTLPixelFormatR32Float;
+   if (tile)
+      gd.colorAttachments[4].pixelFormat = MTLPixelFormatRGBA8Unorm;
+   gd.depthAttachmentPixelFormat = MTLPixelFormatDepth32Float;
+   st.pGeom = [g_dev newRenderPipelineStateWithDescriptor:gd error:&err];
+   if (!st.pGeom)
+      gb_die("deferred geom pipeline failed: %s", err.localizedDescription.UTF8String);
+
+   MTLRenderPipelineDescriptor *ld = [MTLRenderPipelineDescriptor new];
+   ld.vertexFunction = [g_lib newFunctionWithName:@"fs_vert"];
+   if (tile) {
+      ld.fragmentFunction = [g_lib newFunctionWithName:(msaa == 4u ? @"deferred_tile_msaa_frag" : @"deferred_tile_frag")];
+      ld.rasterSampleCount = msaa;
+      ld.colorAttachments[0].pixelFormat = MTLPixelFormatRGBA8Unorm;
+      ld.colorAttachments[1].pixelFormat = MTLPixelFormatRGBA16Float;
+      ld.colorAttachments[2].pixelFormat = MTLPixelFormatRGBA8Unorm;
+      ld.colorAttachments[3].pixelFormat = MTLPixelFormatR32Float;
+      ld.colorAttachments[4].pixelFormat = MTLPixelFormatRGBA8Unorm;
+      ld.depthAttachmentPixelFormat = MTLPixelFormatDepth32Float;
+   } else {
+      ld.fragmentFunction = [g_lib newFunctionWithName:(msaa == 4u ? @"deferred_dram_msaa_frag" : @"deferred_dram_frag")];
+      ld.rasterSampleCount = 1;
+      ld.colorAttachments[0].pixelFormat = MTLPixelFormatRGBA8Unorm;
+   }
+   st.pLight = [g_dev newRenderPipelineStateWithDescriptor:ld error:&err];
+   if (!st.pLight)
+      gb_die("deferred light pipeline failed: %s", err.localizedDescription.UTF8String);
+   return st;
+}
+
+static id
+deferred_setup(const struct gb_opts *o, char *err, size_t n)
+{
+   const char *mode = gb_param(o, "mode", "tile");
+   bool tile = !strcmp(mode, "tile");
+   if (!tile && strcmp(mode, "dram")) {
+      snprintf(err, n, "mode must be tile or dram");
+      return nil;
+   }
+   uint32_t w = 0, h = 0;
+   if (!parse_res(gb_param(o, "res", "1080p"), &w, &h)) {
+      snprintf(err, n, "res must be 720p, 1080p, 1440p or 2160p");
+      return nil;
+   }
+   long msaa = gb_param_int(o, "msaa", 1);
+   if (msaa != 1 && msaa != 4) {
+      snprintf(err, n, "msaa must be 1 or 4");
+      return nil;
+   }
+   return deferred_make_state(w, h, (uint32_t)msaa, tile);
+}
+
+static void
+deferred_encode(id state, id<MTLCommandBuffer> cb, uint64_t k)
+{
+   (void)k;
+   GBDeferredState *st = state;
+   if (st.tile) {
+      MTLRenderPassDescriptor *rp = [MTLRenderPassDescriptor renderPassDescriptor];
+      id<MTLTexture> gs[4] = {st.g0, st.g1, st.g2, st.g3};
+      for (int i = 0; i < 4; i++) {
+         rp.colorAttachments[i].texture = gs[i];
+         rp.colorAttachments[i].loadAction = MTLLoadActionClear;
+         rp.colorAttachments[i].storeAction = MTLStoreActionDontCare;
+      }
+      if (st.msaa == 4u) {
+         rp.colorAttachments[4].texture = st.finalMs;
+         rp.colorAttachments[4].resolveTexture = st.finalTex;
+         rp.colorAttachments[4].loadAction = MTLLoadActionClear;
+         rp.colorAttachments[4].storeAction = MTLStoreActionMultisampleResolve;
+      } else {
+         rp.colorAttachments[4].texture = st.finalTex;
+         rp.colorAttachments[4].loadAction = MTLLoadActionClear;
+         rp.colorAttachments[4].storeAction = MTLStoreActionStore;
+      }
+      rp.depthAttachment.texture = st.depthTex;
+      rp.depthAttachment.loadAction = MTLLoadActionClear;
+      rp.depthAttachment.storeAction = MTLStoreActionDontCare;
+      rp.depthAttachment.clearDepth = 1.0;
+
+      id<MTLRenderCommandEncoder> e = [cb renderCommandEncoderWithDescriptor:rp];
+      [e setRenderPipelineState:st.pGeom];
+      [e setDepthStencilState:st.dsLess];
+      [e drawPrimitives:MTLPrimitiveTypeTriangle vertexStart:0 vertexCount:GB_DEFERRED_QUADS * 6u];
+      [e setRenderPipelineState:st.pLight];
+      [e setDepthStencilState:st.dsNone];
+      [e drawPrimitives:MTLPrimitiveTypeTriangle vertexStart:0 vertexCount:3];
+      [e endEncoding];
+   } else {
+      MTLRenderPassDescriptor *rp1 = [MTLRenderPassDescriptor renderPassDescriptor];
+      id<MTLTexture> gs[4] = {st.g0, st.g1, st.g2, st.g3};
+      for (int i = 0; i < 4; i++) {
+         rp1.colorAttachments[i].texture = gs[i];
+         rp1.colorAttachments[i].loadAction = MTLLoadActionClear;
+         rp1.colorAttachments[i].storeAction = MTLStoreActionStore;
+      }
+      rp1.depthAttachment.texture = st.depthTex;
+      rp1.depthAttachment.loadAction = MTLLoadActionClear;
+      rp1.depthAttachment.storeAction = MTLStoreActionDontCare;
+      rp1.depthAttachment.clearDepth = 1.0;
+
+      id<MTLRenderCommandEncoder> e1 = [cb renderCommandEncoderWithDescriptor:rp1];
+      [e1 setRenderPipelineState:st.pGeom];
+      [e1 setDepthStencilState:st.dsLess];
+      [e1 drawPrimitives:MTLPrimitiveTypeTriangle vertexStart:0 vertexCount:GB_DEFERRED_QUADS * 6u];
+      [e1 endEncoding];
+
+      MTLRenderPassDescriptor *rp2 = [MTLRenderPassDescriptor renderPassDescriptor];
+      rp2.colorAttachments[0].texture = st.finalTex;
+      rp2.colorAttachments[0].loadAction = MTLLoadActionClear;
+      rp2.colorAttachments[0].storeAction = MTLStoreActionStore;
+      id<MTLRenderCommandEncoder> e2 = [cb renderCommandEncoderWithDescriptor:rp2];
+      [e2 setRenderPipelineState:st.pLight];
+      [e2 setFragmentTexture:st.g0 atIndex:0];
+      [e2 setFragmentTexture:st.g1 atIndex:1];
+      [e2 setFragmentTexture:st.g2 atIndex:2];
+      [e2 setFragmentTexture:st.g3 atIndex:3];
+      [e2 drawPrimitives:MTLPrimitiveTypeTriangle vertexStart:0 vertexCount:3];
+      [e2 endEncoding];
+   }
+}
+
+static void
+deferred_derive(const struct gb_opts *o, struct gb_result *r, const struct gb_samples *us)
+{
+   uint32_t w = 1920, h = 1080;
+   parse_res(gb_param(o, "res", "1080p"), &w, &h);
+   gb_derive_rate(r, "gpix_s", "Gpix/s", us, (double)w * h / 1e9 * 1e6);
+   gb_derive_rate(r, "fps", "fps", us, 1e6);
+}
+
+static void
+deferred_check(id state, struct gb_check *chk)
+{
+   GBDeferredState *st = state;
+   uint8_t *got = malloc((size_t)st.w * st.h * 4u);
+   mtl_tex_readback(st.finalTex, got, st.w, st.h, 4u);
+   gb_deferred_check_fb(got, st.w, st.h, chk);
+   free(got);
+}
+
+static const char *const deferred_params[] = {"mode", "res", "msaa", NULL};
+static const struct mtest t_render_deferred = {
+   .name = "render.deferred", .known = deferred_params, .depths = {1, 2}, .nd = 2,
+   .setup = deferred_setup, .encode = deferred_encode, .derive = deferred_derive, .check = deferred_check,
+};
+
+/* ---- 6. concurrent.sram ---- */
+
+static int
+run_concurrent_sram(const struct gb_opts *o)
+{
+   static const char *const known[] = {"res", "msaa", NULL};
+   if (!gb_check_params(o, known)) {
+      gb_result_simple(o, GB_MODE_QUEUES, 1, NULL, "fail", "unknown parameter");
+      return 1;
+   }
+   uint32_t w = 0, h = 0;
+   if (!parse_res(gb_param(o, "res", "1080p"), &w, &h)) {
+      gb_result_simple(o, GB_MODE_QUEUES, 1, NULL, "fail", "res must be 720p, 1080p, 1440p or 2160p");
+      return 1;
+   }
+   long msaa = gb_param_int(o, "msaa", 4);
+   if (msaa != 1 && msaa != 4) {
+      gb_result_simple(o, GB_MODE_QUEUES, 1, NULL, "fail", "msaa must be 1 or 4");
+      return 1;
+   }
+   ctx_init();
+   const int depth = GB_CR_DEPTH;
+   const uint64_t W = (uint64_t)o->warmup_ms * 1000000ull, R = (uint64_t)o->run_ms * 1000000ull;
+   GBUberState *ub = uber_make_state(GB_UBER_SRAM);
+   GBDeferredState *def = deferred_make_state(w, h, (uint32_t)msaa, true);
+   GBStream *sc = [[GBStream alloc] initWithQueue:new_queue(depth) depth:depth
+                                           encode:^(id<MTLCommandBuffer> cb, uint64_t k) { uber_encode(ub, cb, k); }
+                                             done:nil];
+   GBStream *sr = [[GBStream alloc] initWithQueue:new_queue(depth) depth:depth
+                                           encode:^(id<MTLCommandBuffer> cb, uint64_t k) { deferred_encode(def, cb, k); }
+                                             done:nil];
+   struct gb_pass ca = {0}, ra = {0};
+   stream_run(sc, false, gb_now_ns(), W, o->runs, R, &ca);
+   stream_run(sr, false, gb_now_ns(), W, o->runs, R, &ra);
+   uint64_t t0 = gb_now_ns() + 20000000ull;
+   struct cr_thr th[2] = {{.s = (__bridge void *)sc, .t0 = t0, .warm = W, .win = R, .nwin = o->runs},
+                          {.s = (__bridge void *)sr, .t0 = t0, .warm = W, .win = R, .nwin = o->runs}};
+   for (int i = 0; i < 2; i++) pthread_create(&th[i].th, NULL, cr_thr_main, &th[i]);
+   for (int i = 0; i < 2; i++) pthread_join(th[i].th, NULL);
+
+   struct gb_check chk = {0};
+   bool bad = ca.failed || ra.failed || th[0].pass.failed || th[1].pass.failed;
+   if (!bad)
+      uber_check(ub, &chk);
+
+   struct gb_result r;
+   const char *extra[3] = {"compute=uber.sram(16KB)", "render=deferred:tile", NULL};
+   gb_result_begin(&r, o, GB_MODE_QUEUES, 2 * depth, extra);
+   gb_result_run_info(&r, o->warmup_ms, o->runs, o->run_ms);
+   struct gb_samples s[4] = {0};
+   gb_pass_rate(&ca, &s[0]);
+   gb_pass_rate(&ra, &s[1]);
+   gb_pass_rate(&th[0].pass, &s[2]);
+   gb_pass_rate(&th[1].pass, &s[3]);
+   for (int i = 0; i < 4; i++) bad |= !s[i].n;
+   if (bad) {
+      gb_result_finish(&r, "fail", NULL, "command buffer error or no completions");
+   } else {
+      gb_result_metric(&r, "compute_alone_us", "us", true, &s[0], true);
+      gb_result_metric(&r, "render_alone_us", "us", true, &s[1], true);
+      gb_result_metric(&r, "compute_conc_us", "us", true, &s[2], true);
+      gb_result_metric(&r, "render_conc_us", "us", true, &s[3], true);
+      double ov = gb_median(&s[0]) / gb_median(&s[2]) + gb_median(&s[1]) / gb_median(&s[3]);
+      gb_result_metric1(&r, "overlap", "x", false, ov);
+      gb_result_end_metrics(&r);
+      gb_result_check(&r, &chk);
+      gb_result_finish(&r, chk.valid ? "ok" : "fail", "overlap",
+                       chk.valid ? NULL : "compute output corrupted under SRAM contention");
+   }
+   for (int i = 0; i < 4; i++) gb_samples_free(&s[i]);
+   gb_pass_free(&ca); gb_pass_free(&ra);
+   gb_pass_free(&th[0].pass); gb_pass_free(&th[1].pass);
+   return 0;
+}
+
+/* ---- 7. render.mdi (Metal ICB + bindless argument buffer) ---- */
+
+@interface GBMdiState : NSObject
+@property(nonatomic) uint32_t draws, bindless;
+@property(nonatomic, strong) id<MTLTexture> target;
+@property(nonatomic, strong) NSMutableArray<id<MTLTexture>> *texs;
+@property(nonatomic, strong) id<MTLBuffer> vb, ib, argBuf;
+@property(nonatomic, strong) id<MTLIndirectCommandBuffer> icb;
+@property(nonatomic, strong) id<MTLRenderPipelineState> rp;
+@property(nonatomic) const __unsafe_unretained id<MTLResource> *resPtrs;
+@property(nonatomic) uint32_t *ref;
+@property(nonatomic) uint32_t refCrc;
+@end
+@implementation GBMdiState
+- (void)dealloc { free((void *)_resPtrs); free(_ref); }
+@end
+
+static id
+mdi_setup(const struct gb_opts *o, char *err, size_t n)
+{
+   long draws = gb_param_int(o, "draws", 4096);
+   long bindless = gb_param_int(o, "bindless", 1024);
+   if (draws < 1 || draws > (long)GB_MDI_MAX_DRAWS) {
+      snprintf(err, n, "draws must be 1..%u", GB_MDI_MAX_DRAWS);
+      return nil;
+   }
+   if (bindless < 1 || bindless > (long)GB_MDI_MAX_BINDLESS) {
+      snprintf(err, n, "bindless must be 1..%u", GB_MDI_MAX_BINDLESS);
+      return nil;
+   }
+   GBMdiState *st = [GBMdiState new];
+   st.draws = (uint32_t)draws;
+   st.bindless = (uint32_t)bindless;
+   st.target = tex_ex(GB_MDI_DIM, GB_MDI_DIM, MTLPixelFormatRGBA8Unorm, 1, MTLStorageModePrivate,
+                      MTLTextureUsageRenderTarget | MTLTextureUsageShaderRead);
+
+   const float verts[8] = {0.0f, 0.0f, 1.0f, 0.0f, 1.0f, 1.0f, 0.0f, 1.0f};
+   const uint16_t idxs[6] = {0, 1, 2, 0, 2, 3};
+   st.vb = buf(sizeof(verts), false);
+   st.ib = buf(sizeof(idxs), false);
+   mtl_buf_upload(st.vb, verts, sizeof(verts));
+   mtl_buf_upload(st.ib, idxs, sizeof(idxs));
+
+   st.texs = [NSMutableArray arrayWithCapacity:st.bindless];
+   __unsafe_unretained id<MTLResource> *ptrs = calloc(st.bindless, sizeof(id<MTLResource>));
+   size_t one_tex = GB_MDI_TEX_DIM * GB_MDI_TEX_DIM * sizeof(uint32_t);
+   id<MTLBuffer> stg = buf(st.bindless * one_tex, true);
+   id<MTLCommandQueue> q = [g_dev newCommandQueue];
+   id<MTLCommandBuffer> cb = [q commandBuffer];
+   id<MTLBlitCommandEncoder> bl = [cb blitCommandEncoder];
+   for (uint32_t t = 0; t < st.bindless; t++) {
+      id<MTLTexture> tx = tex_ex(GB_MDI_TEX_DIM, GB_MDI_TEX_DIM, MTLPixelFormatRGBA8Unorm, 1,
+                                 MTLStorageModePrivate, MTLTextureUsageShaderRead);
+      gb_mdi_fill_tex(t, (uint32_t *)((uint8_t *)stg.contents + t * one_tex));
+      [bl copyFromBuffer:stg sourceOffset:t * one_tex
+       sourceBytesPerRow:GB_MDI_TEX_DIM * 4 sourceBytesPerImage:one_tex
+              sourceSize:MTLSizeMake(GB_MDI_TEX_DIM, GB_MDI_TEX_DIM, 1)
+               toTexture:tx destinationSlice:0 destinationLevel:0 destinationOrigin:MTLOriginMake(0, 0, 0)];
+      [st.texs addObject:tx];
+      ptrs[t] = tx;
+   }
+   [bl endEncoding];
+   [cb commit];
+   [cb waitUntilCompleted];
+   st.resPtrs = ptrs;
+
+   id<MTLFunction> vf = [g_lib newFunctionWithName:@"mdi_vert"];
+   id<MTLFunction> ff = [g_lib newFunctionWithName:@"mdi_frag"];
+   id<MTLArgumentEncoder> ae = [ff newArgumentEncoderWithBufferIndex:0];
+   st.argBuf = buf(ae.encodedLength, true);
+   [ae setArgumentBuffer:st.argBuf offset:0];
+   for (uint32_t t = 0; t < st.bindless; t++)
+      [ae setTexture:st.texs[t] atIndex:t];
+
+   MTLVertexDescriptor *vd = [MTLVertexDescriptor vertexDescriptor];
+   vd.attributes[0].format = MTLVertexFormatFloat2;
+   vd.attributes[0].offset = 0;
+   vd.attributes[0].bufferIndex = 0;
+   vd.layouts[0].stride = 8;
+
+   MTLRenderPipelineDescriptor *rpd = [MTLRenderPipelineDescriptor new];
+   rpd.vertexFunction = vf;
+   rpd.fragmentFunction = ff;
+   rpd.vertexDescriptor = vd;
+   rpd.colorAttachments[0].pixelFormat = MTLPixelFormatRGBA8Unorm;
+   rpd.supportIndirectCommandBuffers = YES;
+   NSError *merr = nil;
+   st.rp = [g_dev newRenderPipelineStateWithDescriptor:rpd error:&merr];
+   if (!st.rp)
+      gb_die("mdi pipeline failed: %s", merr.localizedDescription.UTF8String);
+
+   MTLIndirectCommandBufferDescriptor *icbd = [MTLIndirectCommandBufferDescriptor new];
+   icbd.commandTypes = MTLIndirectCommandTypeDrawIndexed;
+   icbd.inheritBuffers = YES;
+   icbd.inheritPipelineState = YES;
+   st.icb = [g_dev newIndirectCommandBufferWithDescriptor:icbd maxCommandCount:st.draws options:SHARED];
+   for (uint32_t d = 0; d < st.draws; d++) {
+      id<MTLIndirectRenderCommand> cmd = [st.icb indirectRenderCommandAtIndex:d];
+      [cmd drawIndexedPrimitives:MTLPrimitiveTypeTriangle
+                      indexCount:6
+                       indexType:MTLIndexTypeUInt16
+                     indexBuffer:st.ib
+               indexBufferOffset:0
+                   instanceCount:1
+                      baseVertex:0
+                    baseInstance:d];
+   }
+
+   st.ref = malloc((size_t)GB_MDI_DIM * GB_MDI_DIM * sizeof(uint32_t));
+   st.refCrc = gb_mdi_ref_fb(st.draws, st.bindless, st.ref);
+   return st;
+}
+
+static void
+mdi_encode(id state, id<MTLCommandBuffer> cb, uint64_t k)
+{
+   (void)k;
+   GBMdiState *st = state;
+   MTLRenderPassDescriptor *rp = [MTLRenderPassDescriptor renderPassDescriptor];
+   rp.colorAttachments[0].texture = st.target;
+   rp.colorAttachments[0].loadAction = MTLLoadActionClear;
+   rp.colorAttachments[0].storeAction = MTLStoreActionStore;
+   rp.colorAttachments[0].clearColor = MTLClearColorMake(0.0, 0.0, 0.0, 1.0);
+   id<MTLRenderCommandEncoder> e = [cb renderCommandEncoderWithDescriptor:rp];
+   [e setRenderPipelineState:st.rp];
+   [e setVertexBuffer:st.vb offset:0 atIndex:0];
+   uint32_t bcnt = st.bindless;
+   [e setVertexBytes:&bcnt length:4 atIndex:1];
+   [e setFragmentBuffer:st.argBuf offset:0 atIndex:0];
+   [e useResources:st.resPtrs count:st.bindless usage:MTLResourceUsageRead stages:MTLRenderStageFragment];
+   [e executeCommandsInBuffer:st.icb withRange:NSMakeRange(0, st.draws)];
+   [e endEncoding];
+}
+
+static void
+mdi_derive(const struct gb_opts *o, struct gb_result *r, const struct gb_samples *us)
+{
+   long draws = gb_param_int(o, "draws", 4096);
+   gb_derive_rate(r, "mdraws_s", "Mdraws/s", us, (double)draws);
+}
+
+static void
+mdi_check(id state, struct gb_check *chk)
+{
+   GBMdiState *st = state;
+   size_t count = (size_t)GB_MDI_DIM * GB_MDI_DIM;
+   uint32_t *got = malloc(count * sizeof(uint32_t));
+   mtl_tex_readback(st.target, got, GB_MDI_DIM, GB_MDI_DIM, 4u);
+   gb_check_words(chk, got, st.ref, st.refCrc, count);
+   free(got);
+}
+
+static const char *const mdi_params[] = {"draws", "bindless", NULL};
+static const struct mtest t_render_mdi = {
+   .name = "render.mdi", .known = mdi_params, .depths = {1, 4}, .nd = 2,
+   .setup = mdi_setup, .encode = mdi_encode, .derive = mdi_derive, .check = mdi_check,
+};
+
+/* ---- 8. compile.pso ---- */
+
+static int
+run_compile_pso(const struct gb_opts *o)
+{
+   static const char *const known[] = {"kind", "count", "salt", NULL};
+   if (!gb_check_params(o, known)) {
+      gb_result_simple(o, GB_MODE_QUEUE, 1, NULL, "fail", "unknown parameter");
+      return 1;
+   }
+   const char *kind = gb_param(o, "kind", "uber");
+   bool is_comp = !strcmp(kind, "compute");
+   bool is_uber = !strcmp(kind, "uber");
+   bool is_gfx = !strcmp(kind, "graphics");
+   if (!is_comp && !is_uber && !is_gfx) {
+      gb_result_simple(o, GB_MODE_QUEUE, 1, NULL, "fail", "kind must be compute, graphics or uber");
+      return 1;
+   }
+   long count = gb_param_int(o, "count", (long)GB_PSO_DEFAULT_COUNT);
+   long salt = gb_param_int(o, "salt", 1);
+   if (count < 1 || count > 256 || (salt != 0 && salt != 1)) {
+      gb_result_simple(o, GB_MODE_QUEUE, 1, NULL, "fail", "count 1..256, salt 0|1");
+      return 1;
+   }
+   ctx_init();
+   uint32_t nonce = salt ? (uint32_t)((gb_now_ns() ^ ((uint64_t)getpid() << 16)) | 1u) : 0x51a71234u;
+
+   NSError *err = nil;
+   MTLBinaryArchiveDescriptor *ad = [MTLBinaryArchiveDescriptor new];
+   id<MTLBinaryArchive> ar = [g_dev newBinaryArchiveWithDescriptor:ad error:&err];
+   if (!ar)
+      gb_die("MTLBinaryArchive failed: %s", err.localizedDescription.UTF8String);
+
+   struct gb_samples cold_s = {0}, warm_s = {0};
+   double cold_total = 0, warm_total = 0;
+   id<MTLComputePipelineState> last_cp = nil;
+   id<MTLRenderPipelineState> last_rp = nil;
+
+   for (int phase = 0; phase < 2; phase++) {
+      uint64_t t_batch0 = gb_now_ns();
+      for (long i = 0; i < count; i++) {
+         @autoreleasepool {
+            uint32_t v0 = (uint32_t)(i + 1);
+            uint32_t v1 = (uint32_t)(is_gfx ? (4u + (uint32_t)(i & 7)) : (8u + (uint32_t)(i & 15)));
+            uint32_t v2 = (uint32_t)(is_uber ? 7u : 3u);
+            uint32_t v3 = nonce + (uint32_t)i * 2654435761u;
+            MTLFunctionConstantValues *fc = [MTLFunctionConstantValues new];
+            [fc setConstantValue:&v0 type:MTLDataTypeUInt atIndex:20];
+            [fc setConstantValue:&v1 type:MTLDataTypeUInt atIndex:21];
+            [fc setConstantValue:&v2 type:MTLDataTypeUInt atIndex:22];
+            [fc setConstantValue:&v3 type:MTLDataTypeUInt atIndex:23];
+
+            uint64_t t0 = gb_now_ns();
+            if (!is_gfx) {
+               id<MTLFunction> fn = [g_lib newFunctionWithName:(is_uber ? @"pso_uber_main" : @"pso_comp_main")
+                                                constantValues:fc error:&err];
+               MTLComputePipelineDescriptor *cd = [MTLComputePipelineDescriptor new];
+               cd.computeFunction = fn;
+               if (phase == 0) {
+                  [ar addComputePipelineFunctionsWithDescriptor:cd error:&err];
+               } else {
+                  cd.binaryArchives = @[ar];
+                  last_cp = [g_dev newComputePipelineStateWithDescriptor:cd options:0 reflection:nil error:&err];
+               }
+            } else {
+               id<MTLFunction> vf = [g_lib newFunctionWithName:@"pso_gfx_vert" constantValues:fc error:&err];
+               id<MTLFunction> ff = [g_lib newFunctionWithName:@"pso_gfx_frag" constantValues:fc error:&err];
+               MTLRenderPipelineDescriptor *rd = [MTLRenderPipelineDescriptor new];
+               rd.vertexFunction = vf;
+               rd.fragmentFunction = ff;
+               rd.colorAttachments[0].pixelFormat = MTLPixelFormatRGBA8Unorm;
+               if (phase == 0) {
+                  [ar addRenderPipelineFunctionsWithDescriptor:rd error:&err];
+               } else {
+                  rd.binaryArchives = @[ar];
+                  last_rp = [g_dev newRenderPipelineStateWithDescriptor:rd error:&err];
+               }
+            }
+            uint64_t t1 = gb_now_ns();
+            gb_samples_push(phase == 0 ? &cold_s : &warm_s, (double)(t1 - t0) / 1e6);
+         }
+      }
+      uint64_t t_batch1 = gb_now_ns();
+      if (phase == 0) cold_total = (double)(t_batch1 - t_batch0) / 1e6;
+      else warm_total = (double)(t_batch1 - t_batch0) / 1e6;
+   }
+
+   /* Smoke-execute the last compiled pipeline. */
+   id<MTLCommandQueue> q = [g_dev newCommandQueue];
+   id<MTLCommandBuffer> cb = [q commandBuffer];
+   if (!is_gfx && last_cp) {
+      id<MTLBuffer> ob = buf(4096, true);
+      id<MTLComputeCommandEncoder> e = [cb computeCommandEncoder];
+      [e setComputePipelineState:last_cp];
+      [e setBuffer:ob offset:0 atIndex:0];
+      [e dispatchThreadgroups:MTLSizeMake(1, 1, 1) threadsPerThreadgroup:MTLSizeMake(64, 1, 1)];
+      [e endEncoding];
+   } else if (is_gfx && last_rp) {
+      id<MTLTexture> ot = tex(64, 64, MTLTextureUsageRenderTarget);
+      id<MTLRenderCommandEncoder> e = [cb renderCommandEncoderWithDescriptor:pass_desc(ot)];
+      [e setRenderPipelineState:last_rp];
+      [e drawPrimitives:MTLPrimitiveTypeTriangle vertexStart:0 vertexCount:3];
+      [e endEncoding];
+   }
+   [cb commit];
+   [cb waitUntilCompleted];
+
+   struct gb_result r;
+   gb_result_begin(&r, o, GB_MODE_QUEUE, 1, NULL);
+   gb_result_metric(&r, "cold_per_pso_ms", "ms", true, &cold_s, true);
+   gb_result_metric1(&r, "cold_total_ms", "ms", true, cold_total);
+   gb_result_metric(&r, "warm_per_pso_ms", "ms", true, &warm_s, true);
+   gb_result_metric1(&r, "warm_total_ms", "ms", true, warm_total);
+   gb_result_metric1(&r, "cache_speedup", "x", false, warm_total > 0.0 ? cold_total / warm_total : 0.0);
+   gb_result_end_metrics(&r);
+   gb_json_obj_begin(&r.j, "counts");
+   gb_json_int(&r.j, "pipelines", count);
+   gb_json_obj_end(&r.j);
+   gb_result_finish(&r, "ok", "cold_per_pso_ms", NULL);
+
+   gb_samples_free(&cold_s);
+   gb_samples_free(&warm_s);
+   return 0;
+}
+
+/* ---- 9. compress.bw (mrt4 | rgba32f | msaa4 | array | storage) ---- */
+
+enum { MCMP_MRT4, MCMP_RGBA32F, MCMP_MSAA4, MCMP_ARRAY, MCMP_STORAGE };
+
+@interface GBCmpState : NSObject
+@property(nonatomic) int kind;
+@property(nonatomic) uint32_t w, h;
+@property(nonatomic, strong) id<MTLTexture> g0, g1, g2, g3, msaaTex, arrTex, finalTex;
+@property(nonatomic, strong) id<MTLRenderPipelineState> rpWrite, rpRead;
+@property(nonatomic, strong) id<MTLComputePipelineState> cpWrite;
+@end
+@implementation GBCmpState
+@end
+
+static id<MTLRenderPipelineState>
+cmp_rpipe(const char *fs, int n_att, const MTLPixelFormat *fmts, NSUInteger samples)
+{
+   MTLRenderPipelineDescriptor *d = [MTLRenderPipelineDescriptor new];
+   d.vertexFunction = [g_lib newFunctionWithName:@"fs_vert"];
+   d.fragmentFunction = [g_lib newFunctionWithName:[NSString stringWithUTF8String:fs]];
+   d.rasterSampleCount = samples;
+   for (int i = 0; i < n_att; i++)
+      d.colorAttachments[i].pixelFormat = fmts[i];
+   NSError *err = nil;
+   id<MTLRenderPipelineState> p = [g_dev newRenderPipelineStateWithDescriptor:d error:&err];
+   if (!p) gb_die("compress render pipeline %s: %s", fs, err.localizedDescription.UTF8String);
+   return p;
+}
+
+static id
+cmp_setup(const struct gb_opts *o, char *err, size_t n)
+{
+   const char *kind = gb_param(o, "kind", "mrt4");
+   int k;
+   if (!strcmp(kind, "mrt4")) k = MCMP_MRT4;
+   else if (!strcmp(kind, "rgba32f")) k = MCMP_RGBA32F;
+   else if (!strcmp(kind, "msaa4")) k = MCMP_MSAA4;
+   else if (!strcmp(kind, "array")) k = MCMP_ARRAY;
+   else if (!strcmp(kind, "storage")) k = MCMP_STORAGE;
+   else { snprintf(err, n, "kind must be mrt4, rgba32f, msaa4, array or storage"); return nil; }
+
+   uint32_t w = 0, h = 0;
+   if (!parse_res(gb_param(o, "res", "1440p"), &w, &h)) {
+      snprintf(err, n, "res must be 720p, 1080p, 1440p or 2160p");
+      return nil;
+   }
+   GBCmpState *st = [GBCmpState new];
+   st.kind = k;
+   if (k == MCMP_ARRAY) { st.w = w >= 2560u ? 1024u : 512u; st.h = st.w; }
+   else { st.w = w; st.h = h; }
+
+   st.finalTex = tex_ex(st.w, st.h, MTLPixelFormatRGBA8Unorm, 1, MTLStorageModePrivate,
+                        MTLTextureUsageRenderTarget | MTLTextureUsageShaderRead);
+   MTLPixelFormat rgba8 = MTLPixelFormatRGBA8Unorm;
+   MTLPixelFormat rgba32f = MTLPixelFormatRGBA32Float;
+   MTLPixelFormat mrt4[4] = {MTLPixelFormatRGBA8Unorm, MTLPixelFormatRGBA16Float,
+                             MTLPixelFormatRGBA8Unorm, MTLPixelFormatR32Float};
+   MTLTextureUsage rt_read = MTLTextureUsageRenderTarget | MTLTextureUsageShaderRead;
+
+   if (k == MCMP_MRT4) {
+      st.g0 = tex_ex(st.w, st.h, mrt4[0], 1, MTLStorageModePrivate, rt_read);
+      st.g1 = tex_ex(st.w, st.h, mrt4[1], 1, MTLStorageModePrivate, rt_read);
+      st.g2 = tex_ex(st.w, st.h, mrt4[2], 1, MTLStorageModePrivate, rt_read);
+      st.g3 = tex_ex(st.w, st.h, mrt4[3], 1, MTLStorageModePrivate, rt_read);
+      st.rpWrite = cmp_rpipe("compress_mrt4_frag", 4, mrt4, 1);
+      st.rpRead = cmp_rpipe("compress_sample4_frag", 1, &rgba8, 1);
+   } else if (k == MCMP_RGBA32F) {
+      st.g0 = tex_ex(st.w, st.h, rgba32f, 1, MTLStorageModePrivate, rt_read);
+      st.rpWrite = cmp_rpipe("compress_write1_frag", 1, &rgba32f, 1);
+      st.rpRead = cmp_rpipe("compress_sample1_frag", 1, &rgba8, 1);
+   } else if (k == MCMP_MSAA4) {
+      st.msaaTex = tex_ex(st.w, st.h, rgba8, 4, MTLStorageModeMemoryless, MTLTextureUsageRenderTarget);
+      st.g0 = tex_ex(st.w, st.h, rgba8, 1, MTLStorageModePrivate, rt_read);
+      st.rpWrite = cmp_rpipe("compress_write1_frag", 1, &rgba8, 4);
+      st.rpRead = cmp_rpipe("compress_sample1_frag", 1, &rgba8, 1);
+   } else if (k == MCMP_ARRAY) {
+      MTLTextureDescriptor *ad = [MTLTextureDescriptor texture2DDescriptorWithPixelFormat:rgba8 width:st.w height:st.h mipmapped:NO];
+      ad.textureType = MTLTextureType2DArray;
+      ad.arrayLength = 6;
+      ad.storageMode = MTLStorageModePrivate;
+      ad.usage = rt_read;
+      ad.hazardTrackingMode = MTLHazardTrackingModeUntracked;
+      st.arrTex = [g_dev newTextureWithDescriptor:ad];
+      st.rpWrite = cmp_rpipe("compress_write1_frag", 1, &rgba8, 1);
+      st.rpRead = cmp_rpipe("compress_array_frag", 1, &rgba8, 1);
+   } else {
+      st.g0 = tex_ex(st.w, st.h, rgba8, 1, MTLStorageModePrivate, MTLTextureUsageShaderWrite | MTLTextureUsageShaderRead);
+      st.cpWrite = cpipe("compress_store_main");
+      st.rpRead = cmp_rpipe("compress_sample1_frag", 1, &rgba8, 1);
+   }
+   return st;
+}
+
+static void
+cmp_encode(id state, id<MTLCommandBuffer> cb, uint64_t k)
+{
+   GBCmpState *st = state;
+   float kf = (float)(k & 15u) * 0.03125f;
+   if (st.kind == MCMP_MRT4) {
+      MTLRenderPassDescriptor *rp = [MTLRenderPassDescriptor renderPassDescriptor];
+      id<MTLTexture> gs[4] = {st.g0, st.g1, st.g2, st.g3};
+      for (int i = 0; i < 4; i++) {
+         rp.colorAttachments[i].texture = gs[i];
+         rp.colorAttachments[i].loadAction = MTLLoadActionDontCare;
+         rp.colorAttachments[i].storeAction = MTLStoreActionStore;
+      }
+      id<MTLRenderCommandEncoder> e = [cb renderCommandEncoderWithDescriptor:rp];
+      float pc[4] = {kf, 0.25f, 0.5f, 0.0f};
+      [e setRenderPipelineState:st.rpWrite];
+      [e setFragmentBytes:pc length:16 atIndex:0];
+      [e drawPrimitives:MTLPrimitiveTypeTriangle vertexStart:0 vertexCount:3];
+      [e endEncoding];
+   } else if (st.kind == MCMP_RGBA32F || st.kind == MCMP_MSAA4) {
+      MTLRenderPassDescriptor *rp = [MTLRenderPassDescriptor renderPassDescriptor];
+      if (st.kind == MCMP_MSAA4) {
+         rp.colorAttachments[0].texture = st.msaaTex;
+         rp.colorAttachments[0].resolveTexture = st.g0;
+         rp.colorAttachments[0].loadAction = MTLLoadActionDontCare;
+         rp.colorAttachments[0].storeAction = MTLStoreActionMultisampleResolve;
+      } else {
+         rp.colorAttachments[0].texture = st.g0;
+         rp.colorAttachments[0].loadAction = MTLLoadActionDontCare;
+         rp.colorAttachments[0].storeAction = MTLStoreActionStore;
+      }
+      id<MTLRenderCommandEncoder> e = [cb renderCommandEncoderWithDescriptor:rp];
+      float pc[4] = {kf, 0.25f, 0.5f, 0.0f};
+      [e setRenderPipelineState:st.rpWrite];
+      [e setFragmentBytes:pc length:16 atIndex:0];
+      [e drawPrimitives:MTLPrimitiveTypeTriangle vertexStart:0 vertexCount:3];
+      [e endEncoding];
+   } else if (st.kind == MCMP_ARRAY) {
+      for (uint32_t l = 0; l < 6; l++) {
+         MTLRenderPassDescriptor *rp = [MTLRenderPassDescriptor renderPassDescriptor];
+         rp.colorAttachments[0].texture = st.arrTex;
+         rp.colorAttachments[0].slice = l;
+         rp.colorAttachments[0].loadAction = MTLLoadActionDontCare;
+         rp.colorAttachments[0].storeAction = MTLStoreActionStore;
+         id<MTLRenderCommandEncoder> e = [cb renderCommandEncoderWithDescriptor:rp];
+         float pc[4] = {kf, (float)l * 0.125f, (float)l * 0.0625f, 0.0f};
+         [e setRenderPipelineState:st.rpWrite];
+         [e setFragmentBytes:pc length:16 atIndex:0];
+         [e drawPrimitives:MTLPrimitiveTypeTriangle vertexStart:0 vertexCount:3];
+         [e endEncoding];
+      }
+   } else {
+      struct { int32_t w, h; float k, pad; } pc = {(int32_t)st.w, (int32_t)st.h, kf, 0.0f};
+      id<MTLComputeCommandEncoder> e = [cb computeCommandEncoder];
+      [e setComputePipelineState:st.cpWrite];
+      [e setTexture:st.g0 atIndex:0];
+      [e setBytes:&pc length:sizeof(pc) atIndex:0];
+      [e dispatchThreadgroups:MTLSizeMake((st.w + 15u) / 16u, (st.h + 15u) / 16u, 1)
+        threadsPerThreadgroup:MTLSizeMake(16, 16, 1)];
+      [e endEncoding];
+   }
+
+   MTLRenderPassDescriptor *rf = [MTLRenderPassDescriptor renderPassDescriptor];
+   rf.colorAttachments[0].texture = st.finalTex;
+   rf.colorAttachments[0].loadAction = MTLLoadActionDontCare;
+   rf.colorAttachments[0].storeAction = MTLStoreActionStore;
+   id<MTLRenderCommandEncoder> ef = [cb renderCommandEncoderWithDescriptor:rf];
+   [ef setRenderPipelineState:st.rpRead];
+   if (st.kind == MCMP_MRT4) {
+      [ef setFragmentTexture:st.g0 atIndex:0];
+      [ef setFragmentTexture:st.g1 atIndex:1];
+      [ef setFragmentTexture:st.g2 atIndex:2];
+      [ef setFragmentTexture:st.g3 atIndex:3];
+   } else if (st.kind == MCMP_ARRAY) {
+      [ef setFragmentTexture:st.arrTex atIndex:0];
+   } else {
+      [ef setFragmentTexture:st.g0 atIndex:0];
+   }
+   [ef drawPrimitives:MTLPrimitiveTypeTriangle vertexStart:0 vertexCount:3];
+   [ef endEncoding];
+}
+
+static void
+cmp_derive(const struct gb_opts *o, struct gb_result *r, const struct gb_samples *us)
+{
+   const char *kind = gb_param(o, "kind", "mrt4");
+   uint32_t w = 2560, h = 1440;
+   parse_res(gb_param(o, "res", "1440p"), &w, &h);
+   double b = 0;
+   if (!strcmp(kind, "mrt4")) b = 44.0 * w * h;
+   else if (!strcmp(kind, "rgba32f")) b = 36.0 * w * h;
+   else if (!strcmp(kind, "msaa4")) b = 28.0 * w * h;
+   else if (!strcmp(kind, "array")) { double d = w >= 2560u ? 1024.0 : 512.0; b = 52.0 * d * d; }
+   else b = 12.0 * w * h;
+   gb_derive_rate(r, "gbps", "GB/s", us, b / 1e9 * 1e6);
+}
+
+static void
+cmp_check(id state, struct gb_check *chk)
+{
+   GBCmpState *st = state;
+   size_t bytes = (size_t)st.w * st.h * 4u;
+   uint8_t *got = malloc(bytes);
+   mtl_tex_readback(st.finalTex, got, st.w, st.h, 4u);
+   chk->done = true;
+   chk->crc = gb_crc32(got, bytes);
+   chk->expected = chk->crc;
+   chk->valid = true;
+   uint32_t nonzero = 0;
+   for (uint32_t y = 0; y < st.h; y += st.h / 8u)
+      for (uint32_t x = 0; x < st.w; x += st.w / 8u) {
+         const uint8_t *px = got + ((size_t)y * st.w + x) * 4u;
+         if (px[3] != 255u) chk->valid = false;
+         if (px[0] || px[1] || px[2]) nonzero++;
+      }
+   if (nonzero < 32u) { chk->valid = false; chk->expected = 0u; }
+   free(got);
+}
+
+static const char *const cmp_params[] = {"kind", "res", NULL};
+static const struct mtest t_compress_bw = {
+   .name = "compress.bw", .known = cmp_params, .depths = {1, 4}, .nd = 2,
+   .setup = cmp_setup, .encode = cmp_encode, .derive = cmp_derive, .check = cmp_check,
+};
+
+/* ---- 10. overlap.passes ---- */
+
+static void
+ov_enc_comp(id<MTLComputePipelineState> cp, id<MTLBuffer> b, id<MTLComputeCommandEncoder> e)
+{
+   struct { uint32_t iters; float a, b; } pc = {GB_ALU_ITERS, GB_ALU_A, GB_ALU_B};
+   [e setComputePipelineState:cp];
+   [e setBuffer:b offset:0 atIndex:0];
+   [e setBytes:&pc length:sizeof(pc) atIndex:1];
+   [e dispatchThreadgroups:MTLSizeMake(GB_ALU_GROUPS / 2u, 1, 1) threadsPerThreadgroup:MTLSizeMake(GB_ALU_LOCAL, 1, 1)];
+}
+
+static void
+ov_enc_render(id<MTLRenderPipelineState> rp, id<MTLTexture> t, id<MTLCommandBuffer> cb, uint64_t k,
+              id<MTLFence> waitF, id<MTLFence> sigF)
+{
+   float color[4] = {(float)(k & 255u) / 255.0f, 0.5f, 0.25f, 0.5f};
+   id<MTLRenderCommandEncoder> e = [cb renderCommandEncoderWithDescriptor:pass_desc(t)];
+   if (waitF) [e waitForFence:waitF beforeStages:MTLRenderStageVertex];
+   [e setRenderPipelineState:rp];
+   [e setFragmentBytes:color length:16 atIndex:0];
+   [e drawPrimitives:MTLPrimitiveTypeTriangle vertexStart:0 vertexCount:3 instanceCount:GB_FILL_LAYERS / 2u];
+   if (sigF) [e updateFence:sigF afterStages:MTLRenderStageFragment];
+   [e endEncoding];
+}
+
+static int
+run_overlap_passes(const struct gb_opts *o)
+{
+   static const char *const known[] = {"kind", NULL};
+   if (!gb_check_params(o, known)) {
+      gb_result_simple(o, GB_MODE_QUEUE, 1, NULL, "fail", "unknown parameter");
+      return 1;
+   }
+   const char *kind = gb_param(o, "kind", "comp_comp");
+   int k = !strcmp(kind, "comp_comp") ? 0 : !strcmp(kind, "comp_render") ? 1
+           : !strcmp(kind, "render_render") ? 2 : !strcmp(kind, "async_cr") ? 3 : -1;
+   if (k < 0) {
+      gb_result_simple(o, GB_MODE_QUEUE, 1, NULL, "fail", "kind must be comp_comp, comp_render, render_render or async_cr");
+      return 1;
+   }
+   ctx_init();
+   const uint64_t W = (uint64_t)o->warmup_ms * 1000000ull, R = (uint64_t)o->run_ms * 1000000ull;
+   id<MTLComputePipelineState> cp = cpipe("alu_main");
+   id<MTLRenderPipelineState> rp = rpipe("fs_vert", "color_frag", true);
+   size_t cbytes = (size_t)(GB_ALU_GROUPS / 2u) * GB_ALU_LOCAL * 4u;
+   id<MTLBuffer> ba = buf(cbytes, false), bb = buf(cbytes, false);
+   id<MTLTexture> ia = tex(1920, 1080, MTLTextureUsageRenderTarget);
+   id<MTLTexture> ib = tex(1920, 1080, MTLTextureUsageRenderTarget);
+   id<MTLFence> fence = [g_dev newFence];
+
+   struct gb_pass pa = {0}, pb = {0}, pnb = {0}, pbar = {0};
+   if (k == 3) {
+      const int depth = GB_CR_DEPTH;
+      GBStream *sa = [[GBStream alloc] initWithQueue:new_queue(depth) depth:depth
+                                              encode:^(id<MTLCommandBuffer> cb, uint64_t seq) {
+         id<MTLComputeCommandEncoder> e = [cb computeCommandEncoder];
+         ov_enc_comp(cp, ba, e); [e endEncoding];
+      } done:nil];
+      GBStream *sb = [[GBStream alloc] initWithQueue:new_queue(depth) depth:depth
+                                              encode:^(id<MTLCommandBuffer> cb, uint64_t seq) {
+         ov_enc_render(rp, ib, cb, seq, nil, nil);
+      } done:nil];
+      GBStream *sbar = [[GBStream alloc] initWithQueue:new_queue(depth) depth:depth
+                                                encode:^(id<MTLCommandBuffer> cb, uint64_t seq) {
+         id<MTLComputeCommandEncoder> e = [cb computeCommandEncoder];
+         ov_enc_comp(cp, ba, e); [e updateFence:fence]; [e endEncoding];
+         ov_enc_render(rp, ib, cb, seq, fence, nil);
+      } done:nil];
+      stream_run(sa, false, gb_now_ns(), W, o->runs, R, &pa);
+      stream_run(sb, false, gb_now_ns(), W, o->runs, R, &pb);
+      uint64_t t0 = gb_now_ns() + 20000000ull;
+      struct cr_thr th[2] = {{.s = (__bridge void *)sa, .t0 = t0, .warm = W, .win = R, .nwin = o->runs},
+                             {.s = (__bridge void *)sb, .t0 = t0, .warm = W, .win = R, .nwin = o->runs}};
+      for (int i = 0; i < 2; i++) pthread_create(&th[i].th, NULL, cr_thr_main, &th[i]);
+      for (int i = 0; i < 2; i++) pthread_join(th[i].th, NULL);
+      stream_run(sbar, false, gb_now_ns(), W, o->runs, R, &pbar);
+
+      struct gb_samples ra_s = {0}, rb_s = {0}, ca_s = {0}, cb_s = {0}, bar_s = {0};
+      gb_pass_rate(&pa, &ra_s); gb_pass_rate(&pb, &rb_s);
+      gb_pass_rate(&th[0].pass, &ca_s); gb_pass_rate(&th[1].pass, &cb_s);
+      gb_pass_rate(&pbar, &bar_s);
+      bool bad = pa.failed || pb.failed || th[0].pass.failed || th[1].pass.failed || pbar.failed ||
+                 !ra_s.n || !rb_s.n || !ca_s.n || !cb_s.n || !bar_s.n;
+      struct gb_result r;
+      gb_result_begin(&r, o, GB_MODE_QUEUES, 2 * depth, NULL);
+      gb_result_run_info(&r, o->warmup_ms, o->runs, o->run_ms);
+      if (bad) {
+         gb_result_finish(&r, "fail", NULL, "command buffer error or no completions");
+      } else {
+         double ma = gb_median(&ra_s), mb = gb_median(&rb_s);
+         double mca = gb_median(&ca_s), mcb = gb_median(&cb_s);
+         double mnb = 1.0 / ((1.0 / mca) * (ma / (ma + mb)) + (1.0 / mcb) * (mb / (ma + mb)));
+         double ov = ma / mca + mb / mcb;
+         double mbar = gb_median(&bar_s);
+         gb_result_metric(&r, "solo_a_us", "us", true, &ra_s, true);
+         gb_result_metric(&r, "solo_b_us", "us", true, &rb_s, true);
+         gb_result_metric(&r, "conc_a_us", "us", true, &ca_s, true);
+         gb_result_metric(&r, "conc_b_us", "us", true, &cb_s, true);
+         gb_result_metric1(&r, "nobarrier_us", "us", true, mnb);
+         gb_result_metric(&r, "barrier_us", "us", true, &bar_s, true);
+         gb_result_metric1(&r, "overlap_ratio", "x", false, ov);
+         gb_result_metric1(&r, "barrier_penalty_us", "us", true, mbar - mnb);
+         gb_result_metric1(&r, "serialization_gap", "x", false, mnb > 0.0 ? mbar / mnb : 0.0);
+         gb_result_finish(&r, "ok", "overlap_ratio", NULL);
+      }
+      gb_samples_free(&ra_s); gb_samples_free(&rb_s); gb_samples_free(&ca_s);
+      gb_samples_free(&cb_s); gb_samples_free(&bar_s);
+      gb_pass_free(&pa); gb_pass_free(&pb); gb_pass_free(&th[0].pass);
+      gb_pass_free(&th[1].pass); gb_pass_free(&pbar);
+      return 0;
+   }
+
+   __block int phase = 0;
+   GBStream *s = [[GBStream alloc] initWithQueue:new_queue(2) depth:2
+                                          encode:^(id<MTLCommandBuffer> cb, uint64_t seq) {
+      bool run_a = phase != 1, run_b = phase != 0, bar = phase == 3;
+      if (k == 0) {
+         id<MTLComputeCommandEncoder> e = [cb computeCommandEncoderWithDispatchType:(bar ? MTLDispatchTypeSerial : MTLDispatchTypeConcurrent)];
+         if (run_a) ov_enc_comp(cp, ba, e);
+         if (bar) [e memoryBarrierWithScope:MTLBarrierScopeBuffers];
+         if (run_b) ov_enc_comp(cp, bb, e);
+         [e endEncoding];
+      } else if (k == 1) {
+         if (run_a) {
+            id<MTLComputeCommandEncoder> e = [cb computeCommandEncoder];
+            ov_enc_comp(cp, ba, e);
+            if (bar) [e updateFence:fence];
+            [e endEncoding];
+         }
+         if (run_b) ov_enc_render(rp, ib, cb, seq, bar ? fence : nil, nil);
+      } else {
+         if (run_a) ov_enc_render(rp, ia, cb, seq, nil, bar ? fence : nil);
+         if (run_b) ov_enc_render(rp, ib, cb, seq + 1, bar ? fence : nil, nil);
+      }
+   } done:nil];
+   phase = 0; stream_run(s, false, gb_now_ns(), W, o->runs, R, &pa);
+   phase = 1; stream_run(s, false, gb_now_ns(), W, o->runs, R, &pb);
+   phase = 2; stream_run(s, false, gb_now_ns(), W, o->runs, R, &pnb);
+   phase = 3; stream_run(s, false, gb_now_ns(), W, o->runs, R, &pbar);
+
+   struct gb_samples sa_s = {0}, sb_s = {0}, snb_s = {0}, sbar_s = {0};
+   gb_pass_rate(&pa, &sa_s); gb_pass_rate(&pb, &sb_s);
+   gb_pass_rate(&pnb, &snb_s); gb_pass_rate(&pbar, &sbar_s);
+   bool bad = pa.failed || pb.failed || pnb.failed || pbar.failed || !sa_s.n || !sb_s.n || !snb_s.n || !sbar_s.n;
+
+   struct gb_result r;
+   gb_result_begin(&r, o, GB_MODE_QUEUE, 2, NULL);
+   gb_result_run_info(&r, o->warmup_ms, o->runs, o->run_ms);
+   if (bad) {
+      gb_result_finish(&r, "fail", NULL, "command buffer error or no completions");
+   } else {
+      double ma = gb_median(&sa_s), mb = gb_median(&sb_s);
+      double mnb = gb_median(&snb_s), mbar = gb_median(&sbar_s);
+      gb_result_metric(&r, "solo_a_us", "us", true, &sa_s, true);
+      gb_result_metric(&r, "solo_b_us", "us", true, &sb_s, true);
+      gb_result_metric(&r, "nobarrier_us", "us", true, &snb_s, true);
+      gb_result_metric(&r, "barrier_us", "us", true, &sbar_s, true);
+      gb_result_metric1(&r, "overlap_ratio", "x", false, mnb > 0.0 ? (ma + mb) / mnb : 0.0);
+      gb_result_metric1(&r, "barrier_penalty_us", "us", true, mbar - mnb);
+      gb_result_metric1(&r, "serialization_gap", "x", false, mnb > 0.0 ? mbar / mnb : 0.0);
+      gb_result_finish(&r, "ok", "overlap_ratio", NULL);
+   }
+   gb_samples_free(&sa_s); gb_samples_free(&sb_s); gb_samples_free(&snb_s); gb_samples_free(&sbar_s);
+   gb_pass_free(&pa); gb_pass_free(&pb); gb_pass_free(&pnb); gb_pass_free(&pbar);
+   return 0;
+}
+
 /* ======================= table ======================= */
 
 static int st_empty(const struct gb_opts *o) { return run_stream_test(o, &t_submit_empty); }
@@ -1559,6 +3028,13 @@ static int st_copy(const struct gb_opts *o) { return run_stream_test(o, &t_copy_
 static int st_diag_fill(const struct gb_opts *o) { return run_stream_test(o, &t_diag_fill); }
 static int st_mem_buffer(const struct gb_opts *o) { return run_mem(o, false); }
 static int st_mem_image(const struct gb_opts *o) { return run_mem(o, true); }
+static int st_uber(const struct gb_opts *o) { return run_stream_test(o, &t_compute_uber); }
+static int st_conv2d(const struct gb_opts *o) { return run_stream_test(o, &t_compute_conv2d); }
+static int st_stereo(const struct gb_opts *o) { return run_stream_test(o, &t_compute_stereo); }
+static int st_edge(const struct gb_opts *o) { return run_stream_test(o, &t_compute_edge); }
+static int st_deferred(const struct gb_opts *o) { return run_stream_test(o, &t_render_deferred); }
+static int st_mdi(const struct gb_opts *o) { return run_stream_test(o, &t_render_mdi); }
+static int st_cmp(const struct gb_opts *o) { return run_stream_test(o, &t_compress_bw); }
 
 static const struct {
    const char *name;
@@ -1578,6 +3054,17 @@ static const struct {
    {"concurrent.cr", run_concurrent},
    {"query", run_query},
    {"idle.wake", run_idle},
+   /* 90%-coverage Wave-1 benchmarks */
+   {"compute.uber", st_uber},
+   {"compute.conv2d", st_conv2d},
+   {"compute.stereo", st_stereo},
+   {"compute.edge", st_edge},
+   {"render.deferred", st_deferred},
+   {"concurrent.sram", run_concurrent_sram},
+   {"render.mdi", st_mdi},
+   {"compile.pso", run_compile_pso},
+   {"compress.bw", st_cmp},
+   {"overlap.passes", run_overlap_passes},
    {NULL, NULL},
 };
 

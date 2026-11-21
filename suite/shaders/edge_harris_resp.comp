@@ -1,0 +1,48 @@
+// SPDX-License-Identifier: GPL-2.0-only
+#version 450
+// compute.edge kind=harris Stage 2: 3x3 structure tensor + integer Harris corner response.
+layout(local_size_x = 16, local_size_y = 16) in;
+layout(std430, set = 0, binding = 0) readonly buffer Grad { uint grad[]; };
+layout(std430, set = 0, binding = 1) writeonly buffer Resp { int resp[]; };
+layout(push_constant) uniform PC { int w; int h; } pc;
+
+shared uint tile[18][18];
+
+void main()
+{
+   int lx = int(gl_LocalInvocationID.x);
+   int ly = int(gl_LocalInvocationID.y);
+   int bx = int(gl_WorkGroupID.x * 16u) - 1;
+   int by = int(gl_WorkGroupID.y * 16u) - 1;
+   uint lid = gl_LocalInvocationIndex;
+   for (uint i = lid; i < 324u; i += 256u) {
+      int tx = int(i % 18u);
+      int ty = int(i / 18u);
+      int sx = clamp(bx + tx, 0, pc.w - 1);
+      int sy = clamp(by + ty, 0, pc.h - 1);
+      tile[ty][tx] = grad[sy * pc.w + sx];
+   }
+   barrier();
+
+   int x = int(gl_GlobalInvocationID.x);
+   int y = int(gl_GlobalInvocationID.y);
+   if (x >= pc.w || y >= pc.h)
+      return;
+
+   int sxx = 0, syy = 0, sxy = 0;
+   for (int dy = 0; dy < 3; dy++) {
+      for (int dx = 0; dx < 3; dx++) {
+         uint g = tile[ly + dy][lx + dx];
+         int gx = (int(g & 0xfffu) - 2048) >> 2;
+         int gy = (int((g >> 12u) & 0xfffu) - 2048) >> 2;
+         sxx += gx * gx;
+         syy += gy * gy;
+         sxy += gx * gy;
+      }
+   }
+   sxx >>= 4; syy >>= 4; sxy >>= 4;
+   int det = sxx * syy - sxy * sxy;
+   int tr = sxx + syy;
+   int r = det - ((tr * tr) >> 4);
+   resp[y * pc.w + x] = max(r, 0);
+}

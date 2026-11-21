@@ -110,26 +110,86 @@ gb_vk_create(struct gb_vk *vk, int device_index, int nqueues)
    VkPhysicalDeviceVulkan13Features f13 = {.sType = VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_VULKAN_1_3_FEATURES};
    VkPhysicalDeviceVulkan12Features f12 = {.sType = VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_VULKAN_1_2_FEATURES,
                                            .pNext = &f13};
-   VkPhysicalDeviceFeatures2 f2 = {.sType = VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_FEATURES_2, .pNext = &f12};
+   VkPhysicalDeviceVulkan11Features f11 = {.sType = VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_VULKAN_1_1_FEATURES,
+                                           .pNext = &f12};
+   VkPhysicalDeviceDynamicRenderingLocalReadFeaturesKHR flr = {
+      .sType = VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_DYNAMIC_RENDERING_LOCAL_READ_FEATURES_KHR,
+   };
+   VkPhysicalDeviceFeatures2 f2 = {.sType = VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_FEATURES_2, .pNext = &f11};
+
+   /* Probe device extensions for optional capabilities. */
+   uint32_t nexts = 0;
+   vkEnumerateDeviceExtensionProperties(vk->pdev, NULL, &nexts, NULL);
+   VkExtensionProperties *extp = nexts ? calloc(nexts, sizeof(*extp)) : NULL;
+   if (nexts)
+      vkEnumerateDeviceExtensionProperties(vk->pdev, NULL, &nexts, extp);
+   bool ext_local_read = false, ext_pipe_stats = false;
+   for (uint32_t i = 0; i < nexts; i++) {
+      if (!strcmp(extp[i].extensionName, VK_KHR_DYNAMIC_RENDERING_LOCAL_READ_EXTENSION_NAME))
+         ext_local_read = true;
+      if (!strcmp(extp[i].extensionName, VK_KHR_PIPELINE_EXECUTABLE_PROPERTIES_EXTENSION_NAME))
+         ext_pipe_stats = true;
+   }
+   free(extp);
+   if (ext_local_read)
+      f13.pNext = &flr;
+
    vkGetPhysicalDeviceFeatures2(vk->pdev, &f2);
    if (!f12.timelineSemaphore || !f12.hostQueryReset || !f13.synchronization2 || !f13.dynamicRendering)
       gb_die("device lacks timelineSemaphore/hostQueryReset/synchronization2/dynamicRendering");
 
+   vk->has_local_read = ext_local_read && flr.dynamicRenderingLocalRead;
+   vk->has_draw_indirect_count = f12.drawIndirectCount;
+   vk->has_descriptor_indexing =
+      f12.descriptorIndexing && f12.runtimeDescriptorArray && f12.shaderSampledImageArrayNonUniformIndexing;
+   vk->has_float16 = f12.shaderFloat16;
+   vk->max_sampled_images = vk->props.limits.maxPerStageDescriptorSampledImages;
+
    VkPhysicalDeviceVulkan13Features e13 = {.sType = VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_VULKAN_1_3_FEATURES,
                                            .synchronization2 = VK_TRUE,
                                            .dynamicRendering = VK_TRUE};
-   VkPhysicalDeviceVulkan12Features e12 = {.sType = VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_VULKAN_1_2_FEATURES,
-                                           .pNext = &e13,
-                                           .timelineSemaphore = VK_TRUE,
-                                           .hostQueryReset = VK_TRUE};
+   VkPhysicalDeviceVulkan12Features e12 = {
+      .sType = VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_VULKAN_1_2_FEATURES,
+      .pNext = &e13,
+      .timelineSemaphore = VK_TRUE,
+      .hostQueryReset = VK_TRUE,
+      .drawIndirectCount = vk->has_draw_indirect_count ? VK_TRUE : VK_FALSE,
+      .descriptorIndexing = vk->has_descriptor_indexing ? VK_TRUE : VK_FALSE,
+      .runtimeDescriptorArray = vk->has_descriptor_indexing ? VK_TRUE : VK_FALSE,
+      .shaderSampledImageArrayNonUniformIndexing = vk->has_descriptor_indexing ? VK_TRUE : VK_FALSE,
+      .shaderFloat16 = vk->has_float16 ? VK_TRUE : VK_FALSE,
+   };
+   VkPhysicalDeviceVulkan11Features e11 = {
+      .sType = VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_VULKAN_1_1_FEATURES,
+      .pNext = &e12,
+      .shaderDrawParameters = f11.shaderDrawParameters ? VK_TRUE : VK_FALSE,
+   };
+   VkPhysicalDeviceDynamicRenderingLocalReadFeaturesKHR elr = {
+      .sType = VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_DYNAMIC_RENDERING_LOCAL_READ_FEATURES_KHR,
+      .dynamicRenderingLocalRead = VK_TRUE,
+   };
    VkPhysicalDevicePipelineExecutablePropertiesFeaturesKHR pef = {
       .sType = VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_PIPELINE_EXECUTABLE_PROPERTIES_FEATURES_KHR,
       .pipelineExecutableInfo = VK_TRUE,
    };
-   VkPhysicalDeviceFeatures2 e2 = {.sType = VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_FEATURES_2, .pNext = &e12};
-   const char *exts[1] = {VK_KHR_PIPELINE_EXECUTABLE_PROPERTIES_EXTENSION_NAME};
-   if (gb_vk_want_pipeline_stats)
-      e13.pNext = &pef;
+   VkPhysicalDeviceFeatures2 e2 = {.sType = VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_FEATURES_2, .pNext = &e11};
+   if (f2.features.multiDrawIndirect)
+      e2.features.multiDrawIndirect = VK_TRUE;
+   if (f2.features.sampleRateShading)
+      e2.features.sampleRateShading = VK_TRUE;
+   const char *exts[4];
+   uint32_t enabled_exts = 0;
+   void **tail = &e13.pNext;
+   if (gb_vk_want_pipeline_stats && ext_pipe_stats) {
+      *tail = &pef;
+      tail = &pef.pNext;
+      exts[enabled_exts++] = VK_KHR_PIPELINE_EXECUTABLE_PROPERTIES_EXTENSION_NAME;
+   }
+   if (vk->has_local_read) {
+      *tail = &elr;
+      tail = &elr.pNext;
+      exts[enabled_exts++] = VK_KHR_DYNAMIC_RENDERING_LOCAL_READ_EXTENSION_NAME;
+   }
 
    float prio[GB_MAX_QUEUES];
    for (int i = 0; i < GB_MAX_QUEUES; i++)
@@ -145,12 +205,26 @@ gb_vk_create(struct gb_vk *vk, int device_index, int nqueues)
       .pNext = &e2,
       .queueCreateInfoCount = 1,
       .pQueueCreateInfos = &qci,
-      .enabledExtensionCount = gb_vk_want_pipeline_stats ? 1 : 0,
+      .enabledExtensionCount = enabled_exts,
       .ppEnabledExtensionNames = exts,
    };
    GB_VK_CHECK(vkCreateDevice(vk->pdev, &dci, NULL, &vk->dev));
    for (int i = 0; i < nqueues; i++)
       vkGetDeviceQueue(vk->dev, vk->qfam, i, &vk->queues[i]);
+   if (vk->has_local_read) {
+      vk->cmd_set_attachment_locations =
+         (PFN_vkCmdSetRenderingAttachmentLocationsKHR)vkGetDeviceProcAddr(vk->dev, "vkCmdSetRenderingAttachmentLocationsKHR");
+      if (!vk->cmd_set_attachment_locations)
+         vk->cmd_set_attachment_locations =
+            (PFN_vkCmdSetRenderingAttachmentLocationsKHR)vkGetDeviceProcAddr(vk->dev, "vkCmdSetRenderingAttachmentLocations");
+      vk->cmd_set_input_attachment_indices =
+         (PFN_vkCmdSetRenderingInputAttachmentIndicesKHR)vkGetDeviceProcAddr(vk->dev, "vkCmdSetRenderingInputAttachmentIndicesKHR");
+      if (!vk->cmd_set_input_attachment_indices)
+         vk->cmd_set_input_attachment_indices =
+            (PFN_vkCmdSetRenderingInputAttachmentIndicesKHR)vkGetDeviceProcAddr(vk->dev, "vkCmdSetRenderingInputAttachmentIndices");
+      if (!vk->cmd_set_attachment_locations || !vk->cmd_set_input_attachment_indices)
+         vk->has_local_read = false;
+   }
 
    /* memory types */
    vk->mem_host = vk->mem_dev = UINT32_MAX;
@@ -278,7 +352,8 @@ gb_buf_destroy(struct gb_vk *vk, struct gb_buf *b)
 }
 
 void
-gb_img_create(struct gb_vk *vk, uint32_t w, uint32_t h, VkFormat fmt, VkImageUsageFlags usage, struct gb_img *im)
+gb_img_create_ex(struct gb_vk *vk, uint32_t w, uint32_t h, VkFormat fmt, VkSampleCountFlagBits samples,
+                 VkImageUsageFlags usage, VkImageAspectFlags aspect, struct gb_img *im)
 {
    memset(im, 0, sizeof(*im));
    im->w = w;
@@ -291,7 +366,7 @@ gb_img_create(struct gb_vk *vk, uint32_t w, uint32_t h, VkFormat fmt, VkImageUsa
       .extent = {w, h, 1},
       .mipLevels = 1,
       .arrayLayers = 1,
-      .samples = VK_SAMPLE_COUNT_1_BIT,
+      .samples = samples,
       .tiling = VK_IMAGE_TILING_OPTIMAL,
       .usage = usage,
       .initialLayout = VK_IMAGE_LAYOUT_UNDEFINED,
@@ -306,16 +381,72 @@ gb_img_create(struct gb_vk *vk, uint32_t w, uint32_t h, VkFormat fmt, VkImageUsa
    };
    GB_VK_CHECK(vkAllocateMemory(vk->dev, &ai, NULL, &im->mem));
    GB_VK_CHECK(vkBindImageMemory(vk->dev, im->img, im->mem, 0));
-   if (usage & (VK_IMAGE_USAGE_COLOR_ATTACHMENT_BIT | VK_IMAGE_USAGE_SAMPLED_BIT | VK_IMAGE_USAGE_STORAGE_BIT)) {
+   if (usage & (VK_IMAGE_USAGE_COLOR_ATTACHMENT_BIT | VK_IMAGE_USAGE_DEPTH_STENCIL_ATTACHMENT_BIT |
+                VK_IMAGE_USAGE_INPUT_ATTACHMENT_BIT | VK_IMAGE_USAGE_SAMPLED_BIT | VK_IMAGE_USAGE_STORAGE_BIT)) {
       VkImageViewCreateInfo vi = {
          .sType = VK_STRUCTURE_TYPE_IMAGE_VIEW_CREATE_INFO,
          .image = im->img,
          .viewType = VK_IMAGE_VIEW_TYPE_2D,
          .format = fmt,
-         .subresourceRange = {VK_IMAGE_ASPECT_COLOR_BIT, 0, 1, 0, 1},
+         .subresourceRange = {aspect, 0, 1, 0, 1},
       };
       GB_VK_CHECK(vkCreateImageView(vk->dev, &vi, NULL, &im->view));
    }
+}
+
+void
+gb_img_create(struct gb_vk *vk, uint32_t w, uint32_t h, VkFormat fmt, VkImageUsageFlags usage, struct gb_img *im)
+{
+   gb_img_create_ex(vk, w, h, fmt, VK_SAMPLE_COUNT_1_BIT, usage, VK_IMAGE_ASPECT_COLOR_BIT, im);
+}
+
+void
+gb_buf_readback(struct gb_vk *vk, const struct gb_buf *src, void *dst, size_t bytes)
+{
+   struct gb_buf stg;
+   gb_buf_create(vk, bytes, VK_BUFFER_USAGE_TRANSFER_DST_BIT, true, &stg);
+   VkCommandBuffer cb = gb_oneshot_begin(vk);
+   VkBufferCopy r = {0, 0, bytes};
+   vkCmdCopyBuffer(cb, src->buf, stg.buf, 1, &r);
+   gb_oneshot_end(vk, cb);
+   memcpy(dst, stg.map, bytes);
+   gb_buf_destroy(vk, &stg);
+}
+
+void
+gb_buf_upload(struct gb_vk *vk, const void *src, struct gb_buf *dst, size_t bytes)
+{
+   struct gb_buf stg;
+   gb_buf_create(vk, bytes, VK_BUFFER_USAGE_TRANSFER_SRC_BIT, true, &stg);
+   memcpy(stg.map, src, bytes);
+   VkCommandBuffer cb = gb_oneshot_begin(vk);
+   VkBufferCopy r = {0, 0, bytes};
+   vkCmdCopyBuffer(cb, stg.buf, dst->buf, 1, &r);
+   gb_oneshot_end(vk, cb);
+   gb_buf_destroy(vk, &stg);
+}
+
+void
+gb_img_readback(struct gb_vk *vk, const struct gb_img *im, VkImageLayout cur_layout, void *dst, size_t bpp)
+{
+   size_t bytes = (size_t)im->w * im->h * bpp;
+   struct gb_buf stg;
+   gb_buf_create(vk, bytes, VK_BUFFER_USAGE_TRANSFER_DST_BIT, true, &stg);
+   VkCommandBuffer cb = gb_oneshot_begin(vk);
+   gb_img_barrier(cb, im->img, cur_layout, VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL,
+                  VK_PIPELINE_STAGE_2_ALL_COMMANDS_BIT, VK_ACCESS_2_MEMORY_WRITE_BIT,
+                  VK_PIPELINE_STAGE_2_TRANSFER_BIT, VK_ACCESS_2_TRANSFER_READ_BIT);
+   VkBufferImageCopy r = {
+      .imageSubresource = {VK_IMAGE_ASPECT_COLOR_BIT, 0, 0, 1},
+      .imageExtent = {im->w, im->h, 1},
+   };
+   vkCmdCopyImageToBuffer(cb, im->img, VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL, stg.buf, 1, &r);
+   gb_img_barrier(cb, im->img, VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL, cur_layout,
+                  VK_PIPELINE_STAGE_2_TRANSFER_BIT, VK_ACCESS_2_TRANSFER_READ_BIT,
+                  VK_PIPELINE_STAGE_2_ALL_COMMANDS_BIT, VK_ACCESS_2_MEMORY_READ_BIT | VK_ACCESS_2_MEMORY_WRITE_BIT);
+   gb_oneshot_end(vk, cb);
+   memcpy(dst, stg.map, bytes);
+   gb_buf_destroy(vk, &stg);
 }
 
 void
@@ -904,7 +1035,7 @@ run_threads(struct gb_stream *streams, int n, bool timed, uint64_t warm, int nwi
 
 static void
 finish_result(const struct gb_opts *o, const struct gb_stream_test *t, enum gb_mode mode, int depth,
-              struct gb_pass *u, struct gb_pass *ti, double first_us, int units)
+              struct gb_pass *u, struct gb_pass *ti, double first_us, int units, const struct gb_check *chk)
 {
    struct gb_result r;
    gb_result_begin(&r, o, mode, depth, NULL);
@@ -932,6 +1063,13 @@ finish_result(const struct gb_opts *o, const struct gb_stream_test *t, enum gb_m
    if (mode != GB_MODE_QUEUE)
       gb_json_int(&r.j, mode == GB_MODE_PROCS ? "procs" : "queues", units);
    gb_json_obj_end(&r.j);
+   if (chk && chk->done) {
+      gb_result_check(&r, chk);
+      if (!chk->valid) {
+         gb_result_finish(&r, "fail", NULL, "output does not match the reference");
+         return;
+      }
+   }
    gb_result_finish(&r, "ok", "us_per_submit", NULL);
 }
 
@@ -959,6 +1097,14 @@ run_child(const struct gb_opts *o, const struct gb_stream_test *t)
    struct gb_pass prime;
    gb_stream_run(&s, false, gb_now_ns(), 0, 1, 30000000ull, &prime); /* build contexts before READY */
    gb_pass_free(&prime);
+   if (t->check) {
+      struct gb_check chk = {0};
+      t->check(&vk, st, &chk);
+      if (chk.done && !chk.valid) {
+         gb_log("child output does not match the reference");
+         return 1;
+      }
+   }
    gb_child_ready();
    const uint64_t W = (uint64_t)o->warmup_ms * 1000000ull, R = (uint64_t)o->run_ms * 1000000ull;
    for (int pass = 0;; pass++) {
@@ -1014,7 +1160,7 @@ run_procs(const struct gb_opts *o, const struct gb_stream_test *t, const int *de
       }
       if (bad)
          u.failed = true;
-      finish_result(o, t, GB_MODE_PROCS, n, &u, do_timed ? &ti : NULL, -1, n);
+      finish_result(o, t, GB_MODE_PROCS, n, &u, do_timed ? &ti : NULL, -1, n, NULL);
       gb_pass_free(&u);
       gb_pass_free(&ti);
       free(ch);
@@ -1088,7 +1234,10 @@ gb_run_stream_test(const struct gb_opts *o, const struct gb_stream_test *t)
             gb_stream_finish(&ss[i]);
          free(ss);
       }
-      finish_result(o, t, o->mode, n, &u, do_timed ? &ti : NULL, first_us, n);
+      struct gb_check chk = {0};
+      if (t->check && !u.failed && !ti.failed)
+         t->check(&vk, st, &chk);
+      finish_result(o, t, o->mode, n, &u, do_timed ? &ti : NULL, first_us, n, &chk);
       gb_pass_free(&u);
       gb_pass_free(&ti);
    }

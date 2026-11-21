@@ -26,6 +26,14 @@ struct gb_vk {
    uint32_t mem_host; /* HOST_VISIBLE | HOST_COHERENT, device-local when available */
    uint32_t mem_dev;  /* DEVICE_LOCAL */
    VkCommandPool oneshot_pool;
+   /* Optional Vulkan 1.2/1.3/1.4 features queried and enabled when present. */
+   bool has_local_read;
+   bool has_draw_indirect_count;
+   bool has_descriptor_indexing;
+   bool has_float16;
+   uint32_t max_sampled_images;
+   PFN_vkCmdSetRenderingAttachmentLocationsKHR cmd_set_attachment_locations;
+   PFN_vkCmdSetRenderingInputAttachmentIndicesKHR cmd_set_input_attachment_indices;
 };
 
 #define GB_VK_CHECK(call)                                                        \
@@ -68,7 +76,13 @@ struct gb_img {
 };
 void gb_img_create(struct gb_vk *vk, uint32_t w, uint32_t h, VkFormat fmt, VkImageUsageFlags usage,
                    struct gb_img *im);
+void gb_img_create_ex(struct gb_vk *vk, uint32_t w, uint32_t h, VkFormat fmt, VkSampleCountFlagBits samples,
+                      VkImageUsageFlags usage, VkImageAspectFlags aspect, struct gb_img *im);
 void gb_img_destroy(struct gb_vk *vk, struct gb_img *im);
+/* Readback helpers (one-shot transfer to host buffer, waits on queue 0). */
+void gb_buf_readback(struct gb_vk *vk, const struct gb_buf *src, void *dst, size_t bytes);
+void gb_buf_upload(struct gb_vk *vk, const void *src, struct gb_buf *dst, size_t bytes);
+void gb_img_readback(struct gb_vk *vk, const struct gb_img *im, VkImageLayout cur_layout, void *dst, size_t bpp);
 /* Image barrier helper (sync2). */
 void gb_img_barrier(VkCommandBuffer cb, VkImage img, VkImageLayout from, VkImageLayout to,
                     VkPipelineStageFlags2 src_stage, VkAccessFlags2 src_access,
@@ -156,5 +170,8 @@ struct gb_stream_test {
    /* derived throughput metrics from per-window us_per_submit */
    void (*derive)(const struct gb_opts *o, struct gb_result *r, const struct gb_samples *us_per_submit);
    bool no_timed; /* never run the timed pass (the test has no GPU work to time) */
+   /* Optional: compare the output of the submissions just run with the
+    * test's reference. Called with the queue idle, once per result. */
+   void (*check)(struct gb_vk *vk, void *state, struct gb_check *chk);
 };
 int gb_run_stream_test(const struct gb_opts *o, const struct gb_stream_test *t);

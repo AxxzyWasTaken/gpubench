@@ -22,7 +22,7 @@ trap 'rm -rf "$T"' EXIT
 SHA=$(cat "$R/.suite_sha" 2>/dev/null || git -C "$R" describe --always --dirty=+dirty --abbrev=7 2>/dev/null || echo unknown)
 clang -O2 -Wall -Wno-unused-parameter -Wno-missing-field-initializers -fobjc-arc -arch arm64 \
   -mmacosx-version-min="$MIN" -I"$R/suite/vk/src" -I"$T" \
-  "$R/suite/metal/main.m" "$R/suite/vk/src/gb_common.c" \
+  "$R/suite/metal/main.m" "$R/suite/vk/src/gb_common.c" "$R/suite/vk/src/gb_wave1_ref.c" \
   -framework Metal -framework Foundation -o "$OUT/gpubench-mtl"
 echo "$SHA" > "$OUT/SUITE_SHA"
 if [ -f "$R/rt/metal/build.sh" ]; then

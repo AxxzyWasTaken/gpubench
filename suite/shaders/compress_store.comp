@@ -1,0 +1,16 @@
+// SPDX-License-Identifier: GPL-2.0-only
+#version 450
+// compress.bw kind=storage Pass 1: compute imageStore of smooth compressible pattern.
+layout(local_size_x = 16, local_size_y = 16) in;
+layout(rgba8, set = 0, binding = 0) writeonly uniform image2D dst_img;
+layout(push_constant) uniform PC { int w; int h; float k; float pad; } pc;
+
+void main()
+{
+   ivec2 p = ivec2(gl_GlobalInvocationID.xy);
+   if (p.x >= pc.w || p.y >= pc.h)
+      return;
+   vec2 q = floor(vec2(p) * 0.0625) * 0.015625;
+   vec4 c = vec4(fract(q.x + pc.k), fract(q.y + 0.25), fract(q.x + q.y), 1.0);
+   imageStore(dst_img, p, c);
+}

@@ -1,0 +1,33 @@
+// SPDX-License-Identifier: GPL-2.0-only
+#version 450
+// compute.uber kind=ilp: strided long-latency global loads interleaved with
+// independent FP32/FP16-dyadic FMA chains and integer mixing.
+layout(local_size_x = 256) in;
+layout(std430, set = 0, binding = 0) readonly buffer In { uint tbl[]; };
+layout(std430, set = 0, binding = 1) writeonly buffer Out { uint o[]; };
+layout(push_constant) uniform PC { uint seed; uint mask; } pc;
+
+void main()
+{
+   uint id = gl_GlobalInvocationID.x;
+   vec4 a = vec4(0.0);
+   vec4 b = vec4(0.0);
+   uint h = id * 2654435761u ^ pc.seed;
+   for (uint it = 0u; it < 16u; it++) {
+      uint base = id * 17u + it * 257u;
+      uint t0 = tbl[(base + 0u * 4099u) & pc.mask];
+      uint t1 = tbl[(base + 1u * 4099u) & pc.mask];
+      uint t2 = tbl[(base + 2u * 4099u) & pc.mask];
+      uint t3 = tbl[(base + 3u * 4099u) & pc.mask];
+      uint t4 = tbl[(base + 4u * 4099u) & pc.mask];
+      uint t5 = tbl[(base + 5u * 4099u) & pc.mask];
+      uint t6 = tbl[(base + 6u * 4099u) & pc.mask];
+      uint t7 = tbl[(base + 7u * 4099u) & pc.mask];
+      a = fma(a, vec4(1.0), vec4(float(t0), float(t1), float(t2), float(t3)) * 0.25);
+      b = fma(b, vec4(1.0), vec4(float(t4), float(t5), float(t6), float(t7)) * 0.5);
+      h = (h ^ (t0 | (t1 << 4u) | (t2 << 8u) | (t3 << 12u) |
+                (t4 << 16u) | (t5 << 20u) | (t6 << 24u) | (t7 << 28u))) * 16777619u;
+   }
+   uvec4 r = uvec4(a * 4.0) + uvec4(b * 2.0);
+   o[id] = (r.x | (r.y << 8u) | (r.z << 16u) | (r.w << 24u)) ^ h;
+}

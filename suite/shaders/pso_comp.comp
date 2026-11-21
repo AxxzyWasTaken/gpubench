@@ -1,0 +1,30 @@
+// SPDX-License-Identifier: GPL-2.0-only
+#version 450
+// compile.pso kind=compute: parameterized compute shader with 4 specialization constants
+// (including per-run anti-cache-dedup NONCE) forcing genuine compilation per variant.
+layout(local_size_x = 64) in;
+layout(constant_id = 0) const uint VAR_ID = 0u;
+layout(constant_id = 1) const uint LOOP_N = 8u;
+layout(constant_id = 2) const uint MASK = 3u;
+layout(constant_id = 3) const uint NONCE = 1u;
+
+layout(std430, set = 0, binding = 0) buffer Out { uint o[]; };
+shared uint scratch[128];
+
+void main()
+{
+   uint id = gl_GlobalInvocationID.x;
+   uint lid = gl_LocalInvocationID.x;
+   uint acc = (id * 2654435761u) ^ NONCE ^ (VAR_ID * 0x9e3779b9u);
+   scratch[lid] = acc;
+   scratch[lid + 64u] = acc ^ 0xa5a5a5a5u;
+   barrier();
+   for (uint i = 0u; i < LOOP_N; i++) {
+      uint s = scratch[(lid + i + (VAR_ID & 7u)) & 127u];
+      if (((i + VAR_ID) & MASK) == 0u)
+         acc = (acc * 16777619u) ^ (s >> ((VAR_ID & 7u) + 1u));
+      else
+         acc = (acc + s + NONCE) ^ (acc << ((VAR_ID & 3u) + 1u));
+   }
+   o[id] = acc;
+}

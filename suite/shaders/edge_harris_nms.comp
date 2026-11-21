@@ -1,0 +1,44 @@
+// SPDX-License-Identifier: GPL-2.0-only
+#version 450
+// compute.edge kind=harris Stage 3: 3x3 local maximum suppression + atomic corner count.
+layout(local_size_x = 16, local_size_y = 16) in;
+layout(std430, set = 0, binding = 0) readonly buffer Resp { int resp[]; };
+layout(std430, set = 0, binding = 1) writeonly buffer Out { uint dst[]; };
+layout(std430, set = 0, binding = 2) buffer Counter { uint count[]; };
+layout(push_constant) uniform PC { int w; int h; } pc;
+
+shared int tile[18][18];
+
+void main()
+{
+   int lx = int(gl_LocalInvocationID.x);
+   int ly = int(gl_LocalInvocationID.y);
+   int bx = int(gl_WorkGroupID.x * 16u) - 1;
+   int by = int(gl_WorkGroupID.y * 16u) - 1;
+   uint lid = gl_LocalInvocationIndex;
+   for (uint i = lid; i < 324u; i += 256u) {
+      int tx = int(i % 18u);
+      int ty = int(i / 18u);
+      int sx = clamp(bx + tx, 0, pc.w - 1);
+      int sy = clamp(by + ty, 0, pc.h - 1);
+      tile[ty][tx] = resp[sy * pc.w + sx];
+   }
+   barrier();
+
+   int x = int(gl_GlobalInvocationID.x);
+   int y = int(gl_GlobalInvocationID.y);
+   if (x >= pc.w || y >= pc.h)
+      return;
+
+   int c = tile[ly + 1][lx + 1];
+   bool peak = c > 4096 &&
+      c > tile[ly + 0][lx + 0] && c > tile[ly + 0][lx + 1] && c > tile[ly + 0][lx + 2] &&
+      c > tile[ly + 1][lx + 0] && c >= tile[ly + 1][lx + 2] &&
+      c >= tile[ly + 2][lx + 0] && c >= tile[ly + 2][lx + 1] && c >= tile[ly + 2][lx + 2];
+   if (peak) {
+      dst[y * pc.w + x] = 255u;
+      atomicAdd(count[0], 1u);
+   } else {
+      dst[y * pc.w + x] = 0u;
+   }
+}

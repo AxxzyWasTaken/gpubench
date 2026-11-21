@@ -1,0 +1,46 @@
+// SPDX-License-Identifier: GPL-2.0-only
+#version 450
+// compile.pso kind=uber: high-register divergent uber-shader parameterized via
+// specialization constants to measure worst-case real-game shader compile latency.
+layout(local_size_x = 64) in;
+layout(constant_id = 0) const uint VAR_ID = 0u;
+layout(constant_id = 1) const uint LOOP_N = 12u;
+layout(constant_id = 2) const uint MASK = 7u;
+layout(constant_id = 3) const uint NONCE = 1u;
+
+layout(std430, set = 0, binding = 0) buffer Out { uint o[]; };
+
+void main()
+{
+   uint id = gl_GlobalInvocationID.x;
+   uvec4 v0 = uvec4(id, id + 1u, id + 2u, id + 3u) ^ uvec4(NONCE);
+   uvec4 v1 = v0 * uvec4(747796405u) + uvec4(VAR_ID);
+   uvec4 v2 = v1 ^ (v0 >> uvec4(5u));
+   uvec4 v3 = v2 * uvec4(2654435761u) + uvec4(NONCE);
+   uvec4 v4 = v3 ^ (v1 << uvec4(3u));
+   uvec4 v5 = v4 + v2 * uvec4(16777619u);
+   uvec4 v6 = v5 ^ (v3 >> uvec4(7u));
+   uvec4 v7 = v6 + v4 ^ uvec4(VAR_ID * 0x9e3779b9u);
+
+   for (uint i = 0u; i < LOOP_N; i++) {
+      uint b = (id + i + VAR_ID) & MASK;
+      if (b == 0u) {
+         v0 += v1 ^ (v2 >> uvec4(3u));
+         v3 = v3 * uvec4(16777619u) ^ v0;
+      } else if (b == 1u) {
+         v1 += v2 ^ (v3 << uvec4(5u));
+         v4 = v4 * uvec4(747796405u) + v1;
+      } else if (b == 2u) {
+         v2 += v4 ^ (v5 >> uvec4(7u));
+         v5 ^= v6 + uvec4(NONCE);
+      } else if (b == 3u) {
+         v3 += v5 ^ (v6 << uvec4(2u));
+         v6 = (v6 ^ v7) * uvec4(2654435761u);
+      } else {
+         v4 += v6 ^ (v7 >> uvec4(9u));
+         v7 = v7 + v0 + uvec4(VAR_ID ^ NONCE);
+      }
+   }
+   uvec4 f = (v0 ^ v1) + (v2 ^ v3) + (v4 ^ v5) + (v6 ^ v7);
+   o[id] = f.x ^ f.y ^ f.z ^ f.w;
+}

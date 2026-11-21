@@ -29,3 +29,31 @@
 #define GB_IDLE_BUDGET_MS 1500           /* idle.wake: samples = budget / gap_ms, clamped */
 #define GB_IDLE_MIN_SAMPLES 6
 #define GB_IDLE_MAX_SAMPLES 40
+
+/* ---- 90%-coverage Wave-1 workload dimensions ---- */
+#define GB_UBER_GROUPS 256u              /* compute.uber: 256 x 256 = 65536 invocations */
+#define GB_UBER_LOCAL 256u
+#define GB_UBER_THREADS (GB_UBER_GROUPS * GB_UBER_LOCAL)
+#define GB_UBER_ITERS 48u                /* narrow post-branch loop iterations */
+#define GB_UBER_ILP_WORDS (4u << 20)     /* 16 MiB input table for kind=ilp */
+#define GB_UBER_SEED 0x13579bdfu
+
+#define GB_CONV_LOCAL 16u                /* compute.conv2d: 16x16 cooperative halo tile */
+#define GB_CONV_RADIUS 8u                /* 17-tap separable filter */
+
+#define GB_STEREO_W 450u                 /* compute.stereo: matches Geekbench Stereo */
+#define GB_STEREO_H 375u
+#define GB_STEREO_PITCH 512u
+#define GB_STEREO_RADIUS 5u              /* 11x11 SAD window */
+#define GB_STEREO_LOCAL 16u
+
+#define GB_EDGE_LOCAL 16u                /* compute.edge: 16x16 + 1px halo = 18x18 tile */
+
+#define GB_DEFERRED_QUADS 4096u          /* render.deferred: 4096 quads = 8192 tris, 4 layers */
+
+#define GB_MDI_DIM 1024u                 /* render.mdi: 1024x1024 RGBA8 target */
+#define GB_MDI_TEX_DIM 16u               /* 16x16 bindless textures */
+#define GB_MDI_MAX_BINDLESS 1024u
+#define GB_MDI_MAX_DRAWS 10000u
+
+#define GB_PSO_DEFAULT_COUNT 32u         /* compile.pso: default variant batch */
