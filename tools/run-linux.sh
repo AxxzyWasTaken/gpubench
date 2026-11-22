@@ -3,7 +3,7 @@
 # run-linux.sh: run the plan on this Linux machine and write one record.
 #
 #   run-linux.sh [--device NAME] [--chunks a,b] [--tests t1,t2] [--out-root DIR]
-#                [--bin DIR] [--lock FILE] [--note TEXT]
+#                [--bin DIR] [--lock FILE] [--note TEXT] [--plans "P1 P2"]
 #
 # --lock wraps every chunk in `flock FILE` (for example /var/tmp/gpu.lock), so
 # the lock is held for one chunk at a time. After every chunk the GPU kernel
@@ -14,7 +14,7 @@ HERE=$(cd "$(dirname "$0")" && pwd)
 ROOT=$(cd "$HERE/.." && pwd)
 . "$HERE/lib-meta.sh"
 DEVICE=$(uname -n 2>/dev/null || echo linux); CHUNKS=""; TESTS=""; OUTROOT="$ROOT/records"
-BIN="$ROOT/build/bin"; LOCK=""; NOTE=""
+BIN="$ROOT/build/bin"; LOCK=""; NOTE=""; PLANS_ARG=""
 while [ $# -gt 0 ]; do
   case "$1" in
     --device) DEVICE=$2; shift 2;;
@@ -24,9 +24,22 @@ while [ $# -gt 0 ]; do
     --bin) BIN=$2; shift 2;;
     --lock) LOCK=$2; shift 2;;
     --note) NOTE=$2; shift 2;;
+    --plans) PLANS_ARG=$2; shift 2;;
     *) echo "run-linux.sh: unknown argument $1" >&2; exit 2;;
   esac
 done
+# --plans picks the plan files (relative paths are taken from the repository root);
+# the default is the standard plan plus the RT plan.
+if [ -n "$PLANS_ARG" ]; then
+  PLANS=""
+  for p in $PLANS_ARG; do
+    case "$p" in /*) ;; *) p="$ROOT/$p";; esac
+    [ -f "$p" ] || { echo "no plan $p" >&2; exit 2; }
+    PLANS="$PLANS $p"
+  done
+else
+  PLANS="$ROOT/suite/plan.txt"; [ -f "$ROOT/rt/plan.txt" ] && PLANS="$PLANS $ROOT/rt/plan.txt"
+fi
 EXE="$BIN/gpubench-vk"
 [ -x "$EXE" ] || { echo "no $EXE (build first)" >&2; exit 2; }
 INFO=$("$EXE" --info 2>/dev/null) || { echo "gpubench-vk --info failed" >&2; exit 3; }
@@ -97,7 +110,6 @@ desktop_alive() {
 STATE_BEFORE=$(state_json)
 echo "record: $REC"
 # chunk order follows the plans
-PLANS="$ROOT/suite/plan.txt"; [ -f "$ROOT/rt/plan.txt" ] && PLANS="$PLANS $ROOT/rt/plan.txt"
 ALL=$(cat $PLANS | awk '$1 !~ /^#/ && NF >= 3 {print $1}' | awk '!seen[$0]++')
 if [ -n "$CHUNKS" ]; then SEL=$(echo "$CHUNKS" | tr ',' ' '); else SEL=$ALL; fi
 STOPPED=""
@@ -135,6 +147,6 @@ jobj schema '"gpubench-record/1"' device "$(jstr "$DEVICE")" os '"linux"' os_ver
   os_build null kernel "$(jstr "$KREL")" kernel_module "$(module_json)" driver "$INFO" \
   mesa_sha "$(jstr_or_null "$MESA")" gpu "$(jobj name "$(jstr "$GPU_NAME")")" firmware "$(jstr_or_null "$FW")" \
   date_utc "$(jstr "$START_ISO")" host "$(jstr "$(uname -n)")" suite_sha "$(jstr "$SUITE_SHA")" \
-  runner "$(jobj chunks "$(jstr "$(echo $SEL | tr ' ' ',')")" env "$(env_json)" duration_s "$(( $(date +%s) - T0 ))")" \
+  runner "$(jobj plans "$(jstr "$(for p in $PLANS; do printf '%s ' "${p#$ROOT/}"; done | sed 's/ $//')")" chunks "$(jstr "$(echo $SEL | tr ' ' ',')")" env "$(env_json)" duration_s "$(( $(date +%s) - T0 ))")" \
   state_before "$STATE_BEFORE" state_after "$STATE_AFTER" health "$HEALTH" notes "$(jstr "$NOTE")" > "$REC/meta.json"
 echo "$(date +%T) done: $(wc -l < "$REC/results.jsonl" 2>/dev/null || echo 0) results in $REC ${STOPPED:+(STOPPED $STOPPED)}"
