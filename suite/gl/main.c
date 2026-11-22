@@ -7,6 +7,7 @@
 #include <string.h>
 #include "gb_gl_work.h"
 #include "gl_wave1.h"
+#include "gl_wave2.h"
 #include "shaders.h"
 
 struct context {
@@ -370,25 +371,27 @@ main(int argc, char **argv)
    struct gb_opts o; gb_parse_opts(&o, argc, argv);
    if (o.list) {
       puts("compute.light\ncompute.heavy\nrender.light\nrender.heavy\n"
-           "compress.bw\nrender.draws\ncompute.uber\ncompute.image\ncompile.pso\nsync.finish");
+           "compress.bw\nrender.draws\ncompute.uber\ncompute.image\ncompile.pso\nsync.finish\n"
+           "render.shadow\ntransfer.ops\nrender.postfx");
       return 0;
    }
    if (o.warmup_ms < 0 || o.run_ms <= 0) gb_die("warmup-ms must be nonnegative and run-ms positive");
    if (o.device || o.child) gb_die("GL supports the EGL default device and mode=queue only");
    bool is_w1 = !o.info && gb_gl_is_wave1(o.test);
+   bool is_w2 = !o.info && gb_gl_is_wave2(o.test);
    struct gb_gl_work w;
    const char *error;
-   if (!o.info && !is_w1 && (!o.test || !gb_gl_work(&o, &w, &error))) gb_die("%s", o.test ? error : "need --test, --info or --list");
+   if (!o.info && !is_w1 && !is_w2 && (!o.test || !gb_gl_work(&o, &w, &error))) gb_die("%s", o.test ? error : "need --test, --info or --list");
    struct context c; create_context(&c, es);
    if (o.info) {
       struct gb_json j; gb_json_init(&j); gb_json_obj_begin(&j, NULL);
       identity(&j, &c); gb_json_obj_end(&j); puts(j.buf); gb_json_free(&j);
       destroy_context(&c); return 0;
    }
-   if (is_w1) {
+   if (is_w1 || is_w2) {
       struct gl_ctx_info ci = {.es = c.es, .compute = c.compute, .timer = c.timer,
                                .timer_bits = c.timer_bits, .emit_identity = identity_cb, .ctx = &c};
-      int rc = gb_gl_run_wave1(&ci, &o, do_verify);
+      int rc = is_w1 ? gb_gl_run_wave1(&ci, &o, do_verify) : gb_gl_run_wave2(&ci, &o, do_verify);
       destroy_context(&c);
       return rc;
    }

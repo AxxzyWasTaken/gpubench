@@ -1377,6 +1377,13 @@ const struct gb_test gb_tests[] = {
    {"compile.pso", gb_run_compile_pso},
    {"compress.bw", gb_run_compress_bw},
    {"overlap.passes", gb_run_overlap_passes},
+   /* 90%-coverage Wave-2 heavy-game / AAA benchmarks */
+   {"render.shadow", gb_run_render_shadow},
+   {"compute.cull_mdi", gb_run_compute_cull_mdi},
+   {"render.bindless_ubo", gb_run_render_bindless_ubo},
+   {"compute.fp16", gb_run_compute_fp16},
+   {"transfer.ops", gb_run_transfer_ops},
+   {"render.postfx", gb_run_render_postfx},
    {NULL, NULL},
 };
 

@@ -13,6 +13,7 @@
 #include "gb_common.h"
 #include "gb_params.h"
 #include "gb_wave1_ref.h"
+#include "gb_wave2_ref.h"
 #include "msl_sources.h"
 
 /* ======================= context ======================= */
@@ -3057,6 +3058,897 @@ run_overlap_passes(const struct gb_opts *o)
    return 0;
 }
 
+/* ======================= 90%-coverage Wave-2 benchmarks ======================= */
+
+static void
+mtl_set_crc_check(struct gb_check *chk, uint32_t got, uint32_t expected)
+{
+   chk->done = true;
+   chk->crc = got;
+   chk->expected = expected;
+   chk->valid = (got == expected);
+}
+
+/* ---- W2.1 render.shadow ---- */
+
+@interface GBShadowState : NSObject
+@property(nonatomic) bool alphaTest;
+@property(nonatomic) uint32_t res, inst;
+@property(nonatomic, strong) id<MTLTexture> depthTex, recvTex;
+@property(nonatomic, strong) id<MTLSamplerState> cmpSampler;
+@property(nonatomic, strong) id<MTLDepthStencilState> dsLess;
+@property(nonatomic, strong) id<MTLRenderPipelineState> pDepth, pRecv;
+@end
+@implementation GBShadowState @end
+
+static id
+shadow_setup(const struct gb_opts *o, char *err, size_t n)
+{
+   const char *mode = gb_param(o, "mode", "depth_only");
+   bool alpha = !strcmp(mode, "alpha_test");
+   if (!alpha && strcmp(mode, "depth_only")) {
+      snprintf(err, n, "mode must be depth_only or alpha_test");
+      return nil;
+   }
+   const char *fmt_s = gb_param(o, "fmt", "d32f");
+   MTLPixelFormat dfmt;
+   if (!strcmp(fmt_s, "d32f")) dfmt = MTLPixelFormatDepth32Float;
+   else if (!strcmp(fmt_s, "d16")) dfmt = MTLPixelFormatDepth16Unorm;
+   else {
+      snprintf(err, n, "fmt must be d32f or d16");
+      return nil;
+   }
+   long res = gb_param_int(o, "res", 2048);
+   long inst = gb_param_int(o, "inst", GB_SHADOW_DEFAULT_INST);
+   if (res < 256 || res > 4096 || inst < 1024 || inst > 16384) {
+      snprintf(err, n, "res 256..4096, inst 1024..16384");
+      return nil;
+   }
+
+   GBShadowState *st = [GBShadowState new];
+   st.alphaTest = alpha;
+   st.res = (uint32_t)res;
+   st.inst = (uint32_t)inst;
+
+   MTLTextureDescriptor *dd = [MTLTextureDescriptor new];
+   dd.textureType = MTLTextureType2DArray;
+   dd.pixelFormat = dfmt;
+   dd.width = st.res;
+   dd.height = st.res;
+   dd.arrayLength = GB_SHADOW_CASCADES;
+   dd.storageMode = MTLStorageModePrivate;
+   dd.usage = MTLTextureUsageRenderTarget | MTLTextureUsageShaderRead;
+   dd.hazardTrackingMode = MTLHazardTrackingModeTracked;
+   st.depthTex = [g_dev newTextureWithDescriptor:dd];
+   if (!st.depthTex) gb_die("shadow depth array failed");
+
+   st.recvTex = tex_ex_opt(GB_SHADOW_RECV_DIM, GB_SHADOW_RECV_DIM, MTLPixelFormatRGBA8Unorm, 1,
+                           MTLTextureUsageRenderTarget | MTLTextureUsageShaderRead, false, true);
+
+   MTLSamplerDescriptor *sd = [MTLSamplerDescriptor new];
+   sd.minFilter = MTLSamplerMinMagFilterLinear;
+   sd.magFilter = MTLSamplerMinMagFilterLinear;
+   sd.sAddressMode = MTLSamplerAddressModeClampToEdge;
+   sd.tAddressMode = MTLSamplerAddressModeClampToEdge;
+   sd.compareFunction = MTLCompareFunctionLess;
+   st.cmpSampler = [g_dev newSamplerStateWithDescriptor:sd];
+
+   MTLDepthStencilDescriptor *dsd = [MTLDepthStencilDescriptor new];
+   dsd.depthCompareFunction = MTLCompareFunctionLess;
+   dsd.depthWriteEnabled = YES;
+   st.dsLess = [g_dev newDepthStencilStateWithDescriptor:dsd];
+
+   NSError *merr = nil;
+   MTLRenderPipelineDescriptor *dp = [MTLRenderPipelineDescriptor new];
+   dp.vertexFunction = [g_lib newFunctionWithName:@"shadow_depth_vert"];
+   dp.fragmentFunction = alpha ? [g_lib newFunctionWithName:@"shadow_alpha_frag"] : nil;
+   dp.depthAttachmentPixelFormat = dfmt;
+   st.pDepth = [g_dev newRenderPipelineStateWithDescriptor:dp error:&merr];
+   if (!st.pDepth) gb_die("shadow depth pipe failed: %s", merr.localizedDescription.UTF8String);
+
+   MTLRenderPipelineDescriptor *rp = [MTLRenderPipelineDescriptor new];
+   rp.vertexFunction = [g_lib newFunctionWithName:@"fs_vert"];
+   rp.fragmentFunction = [g_lib newFunctionWithName:@"shadow_pcf_frag"];
+   rp.colorAttachments[0].pixelFormat = MTLPixelFormatRGBA8Unorm;
+   st.pRecv = [g_dev newRenderPipelineStateWithDescriptor:rp error:&merr];
+   if (!st.pRecv) gb_die("shadow recv pipe failed: %s", merr.localizedDescription.UTF8String);
+   return st;
+}
+
+static void
+shadow_encode(id state, id<MTLCommandBuffer> cb, uint64_t k)
+{
+   (void)k;
+   GBShadowState *st = state;
+   for (uint32_t c = 0; c < GB_SHADOW_CASCADES; c++) {
+      MTLRenderPassDescriptor *rp = [MTLRenderPassDescriptor renderPassDescriptor];
+      rp.depthAttachment.texture = st.depthTex;
+      rp.depthAttachment.slice = c;
+      rp.depthAttachment.loadAction = MTLLoadActionClear;
+      rp.depthAttachment.storeAction = MTLStoreActionStore;
+      rp.depthAttachment.clearDepth = 1.0;
+      id<MTLRenderCommandEncoder> e = [cb renderCommandEncoderWithDescriptor:rp];
+      [e setRenderPipelineState:st.pDepth];
+      [e setDepthStencilState:st.dsLess];
+      uint32_t pc[2] = {c, st.res};
+      [e setVertexBytes:pc length:sizeof(pc) atIndex:0];
+      [e drawPrimitives:MTLPrimitiveTypeTriangle vertexStart:0 vertexCount:6 instanceCount:st.inst];
+      [e endEncoding];
+   }
+   MTLRenderPassDescriptor *rp = [MTLRenderPassDescriptor renderPassDescriptor];
+   rp.colorAttachments[0].texture = st.recvTex;
+   rp.colorAttachments[0].loadAction = MTLLoadActionClear;
+   rp.colorAttachments[0].storeAction = MTLStoreActionStore;
+   rp.colorAttachments[0].clearColor = MTLClearColorMake(0, 0, 0, 1);
+   id<MTLRenderCommandEncoder> e = [cb renderCommandEncoderWithDescriptor:rp];
+   [e setRenderPipelineState:st.pRecv];
+   [e setFragmentTexture:st.depthTex atIndex:0];
+   [e setFragmentSamplerState:st.cmpSampler atIndex:0];
+   float inv_res = 1.0f / (float)st.res;
+   [e setFragmentBytes:&inv_res length:sizeof(inv_res) atIndex:0];
+   [e drawPrimitives:MTLPrimitiveTypeTriangle vertexStart:0 vertexCount:3];
+   [e endEncoding];
+}
+
+static void
+shadow_derive(const struct gb_opts *o, struct gb_result *r, const struct gb_samples *us)
+{
+   long inst = gb_param_int(o, "inst", GB_SHADOW_DEFAULT_INST);
+   long res = gb_param_int(o, "res", 2048);
+   double tris = (double)GB_SHADOW_CASCADES * (double)inst * 2.0;
+   double pix = (double)GB_SHADOW_CASCADES * (double)res * (double)res +
+                (double)GB_SHADOW_RECV_DIM * (double)GB_SHADOW_RECV_DIM;
+   gb_derive_rate(r, "mtri_s", "Mtri/s", us, tris);
+   gb_derive_rate(r, "gpix_s", "Gpix/s", us, pix / 1e3);
+}
+
+static void
+shadow_check(id state, struct gb_check *chk)
+{
+   GBShadowState *st = state;
+   uint8_t *got = malloc((size_t)GB_SHADOW_RECV_DIM * GB_SHADOW_RECV_DIM * 4u);
+   mtl_tex_readback(st.recvTex, got, GB_SHADOW_RECV_DIM, GB_SHADOW_RECV_DIM, 4u);
+   gb_shadow_check_fb(got, GB_SHADOW_RECV_DIM, GB_SHADOW_RECV_DIM, st.alphaTest, chk);
+   free(got);
+}
+
+static const char *const shadow_params[] = {"mode", "fmt", "res", "inst", NULL};
+static const struct mtest t_render_shadow = {
+   .name = "render.shadow", .known = shadow_params, .depths = {1, 2}, .nd = 2,
+   .setup = shadow_setup, .encode = shadow_encode, .derive = shadow_derive, .check = shadow_check,
+};
+
+/* ---- W2.2 compute.cull_mdi ---- */
+
+@interface GBCullMdiState : NSObject
+@property(nonatomic) uint32_t objs, visiblePct, expectedVis, expectedCrc;
+@property(nonatomic, strong) id<MTLComputePipelineState> pCull;
+@property(nonatomic, strong) id<MTLRenderPipelineState> pDraw;
+@property(nonatomic, strong) id<MTLBuffer> objsBuf, icbArgBuf, rangeBuf, ibBuf;
+@property(nonatomic, strong) id<MTLIndirectCommandBuffer> icb;
+@property(nonatomic, strong) id<MTLTexture> fbTex;
+@end
+@implementation GBCullMdiState @end
+
+static id
+cull_mdi_setup(const struct gb_opts *o, char *err, size_t n)
+{
+   long objs = gb_param_int(o, "objs", GB_CULL_MAX_OBJS);
+   long vis = gb_param_int(o, "visible", 25);
+   if (objs < 64 || objs > (long)GB_CULL_MAX_OBJS || vis < 0 || vis > 100) {
+      snprintf(err, n, "objs 64..16384, visible 0..100");
+      return nil;
+   }
+   GBCullMdiState *st = [GBCullMdiState new];
+   st.objs = (uint32_t)objs;
+   st.visiblePct = (uint32_t)vis;
+
+   struct gb_cull_obj *host = calloc(st.objs, sizeof(*host));
+   st.expectedVis = gb_cull_mdi_fill_objects(st.objs, st.visiblePct, host);
+   uint32_t *ref = malloc((size_t)GB_CULL_DIM * GB_CULL_DIM * 4u);
+   st.expectedCrc = gb_cull_mdi_ref_fb(host, st.objs, ref);
+   free(ref);
+
+   st.objsBuf = buf_tracked((size_t)st.objs * sizeof(struct gb_cull_obj), false);
+   mtl_buf_upload(st.objsBuf, host, (size_t)st.objs * sizeof(struct gb_cull_obj));
+   free(host);
+
+   static const uint16_t idx[6] = {0, 1, 2, 0, 2, 3};
+   st.ibBuf = buf_tracked(sizeof(idx), false);
+   mtl_buf_upload(st.ibBuf, idx, sizeof(idx));
+   st.rangeBuf = buf_tracked(16, false);
+
+   MTLIndirectCommandBufferDescriptor *idsc = [MTLIndirectCommandBufferDescriptor new];
+   idsc.commandTypes = MTLIndirectCommandTypeDrawIndexed;
+   idsc.inheritBuffers = YES;
+   idsc.inheritPipelineState = YES;
+   st.icb = [g_dev newIndirectCommandBufferWithDescriptor:idsc
+                                          maxCommandCount:st.objs
+                                                  options:MTLResourceStorageModePrivate | MTLResourceHazardTrackingModeTracked];
+   if (!st.icb) gb_die("cull_mdi ICB allocation failed");
+
+   id<MTLFunction> cf = [g_lib newFunctionWithName:@"cull_mdi_comp"];
+   if (!cf) gb_die("missing cull_mdi_comp");
+   NSError *merr = nil;
+   st.pCull = [g_dev newComputePipelineStateWithFunction:cf error:&merr];
+   if (!st.pCull) gb_die("cull_mdi compute pipe failed: %s", merr.localizedDescription.UTF8String);
+
+   id<MTLArgumentEncoder> ae = [cf newArgumentEncoderWithBufferIndex:1];
+   st.icbArgBuf = buf_tracked(ae.encodedLength, true);
+   [ae setArgumentBuffer:st.icbArgBuf offset:0];
+   [ae setIndirectCommandBuffer:st.icb atIndex:0];
+
+   MTLRenderPipelineDescriptor *rp = [MTLRenderPipelineDescriptor new];
+   rp.vertexFunction = [g_lib newFunctionWithName:@"cull_mdi_vert"];
+   rp.fragmentFunction = [g_lib newFunctionWithName:@"cull_mdi_frag"];
+   rp.colorAttachments[0].pixelFormat = MTLPixelFormatRGBA8Unorm;
+   rp.supportIndirectCommandBuffers = YES;
+   st.pDraw = [g_dev newRenderPipelineStateWithDescriptor:rp error:&merr];
+   if (!st.pDraw) gb_die("cull_mdi render pipe failed: %s", merr.localizedDescription.UTF8String);
+
+   st.fbTex = tex_ex_opt(GB_CULL_DIM, GB_CULL_DIM, MTLPixelFormatRGBA8Unorm, 1,
+                         MTLTextureUsageRenderTarget | MTLTextureUsageShaderRead, false, true);
+   return st;
+}
+
+static void
+cull_mdi_encode(id state, id<MTLCommandBuffer> cb, uint64_t k)
+{
+   (void)k;
+   GBCullMdiState *st = state;
+   id<MTLBlitCommandEncoder> b = [cb blitCommandEncoder];
+   [b fillBuffer:st.rangeBuf range:NSMakeRange(0, 8) value:0];
+   [b resetCommandsInBuffer:st.icb withRange:NSMakeRange(0, st.objs)];
+   [b endEncoding];
+
+   id<MTLComputeCommandEncoder> ce = [cb computeCommandEncoder];
+   [ce setComputePipelineState:st.pCull];
+   [ce useResource:st.icb usage:MTLResourceUsageWrite];
+   [ce setBuffer:st.objsBuf offset:0 atIndex:0];
+   [ce setBuffer:st.icbArgBuf offset:0 atIndex:1];
+   [ce setBuffer:st.rangeBuf offset:0 atIndex:2];
+   [ce setBuffer:st.ibBuf offset:0 atIndex:3];
+   uint32_t n_objs = st.objs;
+   [ce setBytes:&n_objs length:4 atIndex:4];
+   [ce dispatchThreadgroups:MTLSizeMake((st.objs + GB_CULL_LOCAL - 1u) / GB_CULL_LOCAL, 1, 1)
+      threadsPerThreadgroup:MTLSizeMake(GB_CULL_LOCAL, 1, 1)];
+   [ce endEncoding];
+
+   MTLRenderPassDescriptor *rp = [MTLRenderPassDescriptor renderPassDescriptor];
+   rp.colorAttachments[0].texture = st.fbTex;
+   rp.colorAttachments[0].loadAction = MTLLoadActionClear;
+   rp.colorAttachments[0].storeAction = MTLStoreActionStore;
+   rp.colorAttachments[0].clearColor = MTLClearColorMake(0, 0, 0, 1);
+   id<MTLRenderCommandEncoder> re = [cb renderCommandEncoderWithDescriptor:rp];
+   [re setRenderPipelineState:st.pDraw];
+   [re setVertexBuffer:st.objsBuf offset:0 atIndex:0];
+   [re useResource:st.icb usage:MTLResourceUsageRead stages:MTLRenderStageVertex];
+   [re useResource:st.ibBuf usage:MTLResourceUsageRead stages:MTLRenderStageVertex];
+   [re executeCommandsInBuffer:st.icb indirectBuffer:st.rangeBuf indirectBufferOffset:0];
+   [re endEncoding];
+}
+
+static void
+cull_mdi_derive(const struct gb_opts *o, struct gb_result *r, const struct gb_samples *us)
+{
+   long objs = gb_param_int(o, "objs", GB_CULL_MAX_OBJS);
+   long vis = gb_param_int(o, "visible", 25);
+   gb_derive_rate(r, "mobjs_s", "Mobjs/s", us, (double)objs);
+   gb_derive_rate(r, "mdraws_s", "Mdraws/s", us, (double)objs * (double)vis / 100.0);
+}
+
+static void
+cull_mdi_check(id state, struct gb_check *chk)
+{
+   GBCullMdiState *st = state;
+   uint32_t rng[2] = {0, 0};
+   mtl_buf_readback(st.rangeBuf, rng, sizeof(rng));
+   uint8_t *fb = malloc((size_t)GB_CULL_DIM * GB_CULL_DIM * 4u);
+   mtl_tex_readback(st.fbTex, fb, GB_CULL_DIM, GB_CULL_DIM, 4u);
+   uint32_t got = gb_crc32(fb, (size_t)GB_CULL_DIM * GB_CULL_DIM * 4u);
+   free(fb);
+   mtl_set_crc_check(chk, got, st.expectedCrc);
+   if (rng[1] != st.expectedVis) {
+      chk->valid = false;
+      gb_log("compute.cull_mdi visible count mismatch: got=%u expected=%u", rng[1], st.expectedVis);
+   }
+}
+
+static const char *const cull_mdi_params[] = {"objs", "visible", NULL};
+static const struct mtest t_compute_cull_mdi = {
+   .name = "compute.cull_mdi", .known = cull_mdi_params, .depths = {1, 2}, .nd = 2,
+   .setup = cull_mdi_setup, .encode = cull_mdi_encode, .derive = cull_mdi_derive, .check = cull_mdi_check,
+};
+
+/* ---- W2.3 render.bindless_ubo ---- */
+
+@interface GBBuboState : NSObject
+@property(nonatomic) uint32_t draws, expectedCrc;
+@property(nonatomic, strong) id<MTLRenderPipelineState> pipe;
+@property(nonatomic, strong) NSArray<id<MTLBuffer>> *banks;
+@property(nonatomic, strong) id<MTLBuffer> argBuf;
+@property(nonatomic, strong) id<MTLHeap> aliasHeap;
+@property(nonatomic, strong) id<MTLTexture> rtAlias, rtFinal;
+@end
+@implementation GBBuboState @end
+
+static id
+bubo_setup(const struct gb_opts *o, char *err, size_t n)
+{
+   const char *mode = gb_param(o, "mode", "ubo_vec4");
+   if (strcmp(mode, "ubo_vec4") && strcmp(mode, "desc_buf")) {
+      snprintf(err, n, "mode must be ubo_vec4 or desc_buf");
+      return nil;
+   }
+   long draws = gb_param_int(o, "draws", GB_BUBO_MAX_DRAWS);
+   if (draws < 1 || draws > (long)GB_BUBO_MAX_DRAWS) {
+      snprintf(err, n, "draws must be 1..2048");
+      return nil;
+   }
+   GBBuboState *st = [GBBuboState new];
+   st.draws = (uint32_t)draws;
+   uint32_t *ref = malloc((size_t)GB_BUBO_DIM * GB_BUBO_DIM * 4u);
+   st.expectedCrc = gb_bubo_ref_fb(st.draws, ref);
+   free(ref);
+
+   NSMutableArray<id<MTLBuffer>> *banks = [NSMutableArray arrayWithCapacity:GB_BUBO_BANKS];
+   float *tmp = malloc(GB_BUBO_ENTRIES * 4u * sizeof(float));
+   for (uint32_t b = 0; b < GB_BUBO_BANKS; b++) {
+      gb_bubo_fill_bank(b, tmp);
+      id<MTLBuffer> ub = buf_tracked(GB_BUBO_ENTRIES * 16u, false);
+      mtl_buf_upload(ub, tmp, GB_BUBO_ENTRIES * 16u);
+      [banks addObject:ub];
+   }
+   free(tmp);
+   st.banks = banks;
+
+   id<MTLFunction> ff = [g_lib newFunctionWithName:@"bubo_frag"];
+   id<MTLArgumentEncoder> ae = [ff newArgumentEncoderWithBufferIndex:0];
+   st.argBuf = buf_tracked(ae.encodedLength, true);
+   [ae setArgumentBuffer:st.argBuf offset:0];
+   for (uint32_t b = 0; b < GB_BUBO_BANKS; b++)
+      [ae setBuffer:banks[b] offset:0 atIndex:b];
+
+   MTLTextureDescriptor *td = [MTLTextureDescriptor texture2DDescriptorWithPixelFormat:MTLPixelFormatRGBA8Unorm
+                                                                                 width:GB_BUBO_DIM
+                                                                                height:GB_BUBO_DIM
+                                                                             mipmapped:NO];
+   td.storageMode = MTLStorageModePrivate;
+   td.usage = MTLTextureUsageRenderTarget | MTLTextureUsageShaderRead;
+   td.hazardTrackingMode = MTLHazardTrackingModeTracked;
+   MTLSizeAndAlign sa = [g_dev heapTextureSizeAndAlignWithDescriptor:td];
+   MTLHeapDescriptor *hd = [MTLHeapDescriptor new];
+   hd.type = MTLHeapTypePlacement;
+   hd.size = sa.size + sa.align;
+   hd.storageMode = MTLStorageModePrivate;
+   hd.hazardTrackingMode = MTLHazardTrackingModeTracked;
+   st.aliasHeap = [g_dev newHeapWithDescriptor:hd];
+   if (!st.aliasHeap) gb_die("bubo alias heap failed");
+   st.rtAlias = [st.aliasHeap newTextureWithDescriptor:td offset:0];
+   st.rtFinal = [st.aliasHeap newTextureWithDescriptor:td offset:0];
+   if (!st.rtAlias || !st.rtFinal) gb_die("bubo aliased textures failed");
+
+   MTLRenderPipelineDescriptor *rp = [MTLRenderPipelineDescriptor new];
+   rp.vertexFunction = [g_lib newFunctionWithName:@"bubo_vert"];
+   rp.fragmentFunction = ff;
+   rp.colorAttachments[0].pixelFormat = MTLPixelFormatRGBA8Unorm;
+   NSError *merr = nil;
+   st.pipe = [g_dev newRenderPipelineStateWithDescriptor:rp error:&merr];
+   if (!st.pipe) gb_die("bubo pipe failed: %s", merr.localizedDescription.UTF8String);
+   return st;
+}
+
+static void
+bubo_encode(id state, id<MTLCommandBuffer> cb, uint64_t k)
+{
+   (void)k;
+   GBBuboState *st = state;
+   __unsafe_unretained id<MTLResource> res[GB_BUBO_BANKS];
+   for (uint32_t b = 0; b < GB_BUBO_BANKS; b++)
+      res[b] = st.banks[b];
+
+   MTLRenderPassDescriptor *rp1 = [MTLRenderPassDescriptor renderPassDescriptor];
+   rp1.colorAttachments[0].texture = st.rtAlias;
+   rp1.colorAttachments[0].loadAction = MTLLoadActionClear;
+   rp1.colorAttachments[0].storeAction = MTLStoreActionStore;
+   rp1.colorAttachments[0].clearColor = MTLClearColorMake(0, 0, 0, 1);
+   id<MTLRenderCommandEncoder> e1 = [cb renderCommandEncoderWithDescriptor:rp1];
+   [e1 setRenderPipelineState:st.pipe];
+   [e1 setFragmentBuffer:st.argBuf offset:0 atIndex:0];
+   [e1 useResources:res count:GB_BUBO_BANKS usage:MTLResourceUsageRead stages:MTLRenderStageFragment];
+   uint32_t wdraws = st.draws > 64u ? 64u : st.draws;
+   for (uint32_t d = 0; d < wdraws; d++) {
+      [e1 setVertexBytes:&d length:4 atIndex:0];
+      [e1 drawPrimitives:MTLPrimitiveTypeTriangle vertexStart:0 vertexCount:6];
+   }
+   [e1 endEncoding];
+
+   MTLRenderPassDescriptor *rp2 = [MTLRenderPassDescriptor renderPassDescriptor];
+   rp2.colorAttachments[0].texture = st.rtFinal;
+   rp2.colorAttachments[0].loadAction = MTLLoadActionClear;
+   rp2.colorAttachments[0].storeAction = MTLStoreActionStore;
+   rp2.colorAttachments[0].clearColor = MTLClearColorMake(0, 0, 0, 1);
+   id<MTLRenderCommandEncoder> e2 = [cb renderCommandEncoderWithDescriptor:rp2];
+   [e2 setRenderPipelineState:st.pipe];
+   [e2 setFragmentBuffer:st.argBuf offset:0 atIndex:0];
+   [e2 useResources:res count:GB_BUBO_BANKS usage:MTLResourceUsageRead stages:MTLRenderStageFragment];
+   for (uint32_t d = 0; d < st.draws; d++) {
+      [e2 setVertexBytes:&d length:4 atIndex:0];
+      [e2 drawPrimitives:MTLPrimitiveTypeTriangle vertexStart:0 vertexCount:6];
+   }
+   [e2 endEncoding];
+}
+
+static void
+bubo_derive(const struct gb_opts *o, struct gb_result *r, const struct gb_samples *us)
+{
+   long draws = gb_param_int(o, "draws", GB_BUBO_MAX_DRAWS);
+   gb_derive_rate(r, "kdraws_s", "kdraws/s", us, (double)draws * 1e3);
+}
+
+static void
+bubo_check(id state, struct gb_check *chk)
+{
+   GBBuboState *st = state;
+   uint8_t *fb = malloc((size_t)GB_BUBO_DIM * GB_BUBO_DIM * 4u);
+   mtl_tex_readback(st.rtFinal, fb, GB_BUBO_DIM, GB_BUBO_DIM, 4u);
+   uint32_t got = gb_crc32(fb, (size_t)GB_BUBO_DIM * GB_BUBO_DIM * 4u);
+   free(fb);
+   mtl_set_crc_check(chk, got, st.expectedCrc);
+}
+
+static const char *const bubo_params[] = {"mode", "draws", NULL};
+static const struct mtest t_render_bindless_ubo = {
+   .name = "render.bindless_ubo", .known = bubo_params, .depths = {1, 2}, .nd = 2,
+   .setup = bubo_setup, .encode = bubo_encode, .derive = bubo_derive, .check = bubo_check,
+};
+
+/* ---- W2.4 compute.fp16 ---- */
+
+@interface GBFp16State : NSObject
+@property(nonatomic) bool gemv;
+@property(nonatomic) uint32_t expectedCrc;
+@property(nonatomic, strong) id<MTLComputePipelineState> cp;
+@property(nonatomic, strong) id<MTLBuffer> wBuf, xBuf, outBuf;
+@end
+@implementation GBFp16State @end
+
+static id
+fp16_setup(const struct gb_opts *o, char *err, size_t n)
+{
+   const char *mode = gb_param(o, "mode", "gemv");
+   bool gemv = !strcmp(mode, "gemv");
+   if (!gemv && strcmp(mode, "alu_mix")) {
+      snprintf(err, n, "mode must be gemv or alu_mix");
+      return nil;
+   }
+   GBFp16State *st = [GBFp16State new];
+   st.gemv = gemv;
+   if (gemv) {
+      size_t wb = (size_t)GB_FP16_GEMV_M * GB_FP16_GEMV_K;
+      size_t xb = (size_t)GB_FP16_GEMV_K * 2u;
+      size_t yb = (size_t)GB_FP16_GEMV_M * sizeof(float);
+      uint32_t *wh = malloc(wb), *xh = malloc(xb);
+      float *yref = malloc(yb);
+      gb_fp16_gemv_fill(wh, xh);
+      st.expectedCrc = gb_fp16_gemv_ref(wh, xh, yref);
+      free(yref);
+      st.wBuf = buf(wb, false);
+      st.xBuf = buf(xb, false);
+      st.outBuf = buf(yb, false);
+      mtl_buf_upload(st.wBuf, wh, wb);
+      mtl_buf_upload(st.xBuf, xh, xb);
+      free(wh); free(xh);
+      st.cp = cpipe("fp16_gemv_main");
+   } else {
+      uint32_t nthr = GB_FP16_ALUMIX_GROUPS * GB_FP16_ALUMIX_LOCAL;
+      float *ref = malloc((size_t)nthr * sizeof(float));
+      st.expectedCrc = gb_fp16_alumix_ref(nthr, GB_FP16_ALUMIX_ITERS, -1.0f, 0.25f, ref);
+      free(ref);
+      st.outBuf = buf((size_t)nthr * sizeof(float), false);
+      st.cp = cpipe("fp16_alumix_main");
+   }
+   return st;
+}
+
+static void
+fp16_encode(id state, id<MTLCommandBuffer> cb, uint64_t k)
+{
+   (void)k;
+   GBFp16State *st = state;
+   id<MTLComputeCommandEncoder> e = [cb computeCommandEncoder];
+   [e setComputePipelineState:st.cp];
+   if (st.gemv) {
+      [e setBuffer:st.wBuf offset:0 atIndex:0];
+      [e setBuffer:st.xBuf offset:0 atIndex:1];
+      [e setBuffer:st.outBuf offset:0 atIndex:2];
+      [e dispatchThreadgroups:MTLSizeMake(GB_FP16_GEMV_M / 4u, 1, 1)
+        threadsPerThreadgroup:MTLSizeMake(GB_FP16_GEMV_LOCAL, 1, 1)];
+   } else {
+      struct { uint32_t iters; float a, b; } pc = {GB_FP16_ALUMIX_ITERS, -1.0f, 0.25f};
+      [e setBuffer:st.outBuf offset:0 atIndex:0];
+      [e setBytes:&pc length:sizeof(pc) atIndex:1];
+      [e dispatchThreadgroups:MTLSizeMake(GB_FP16_ALUMIX_GROUPS, 1, 1)
+        threadsPerThreadgroup:MTLSizeMake(GB_FP16_ALUMIX_LOCAL, 1, 1)];
+   }
+   [e endEncoding];
+}
+
+static void
+fp16_derive(const struct gb_opts *o, struct gb_result *r, const struct gb_samples *us)
+{
+   if (!strcmp(gb_param(o, "mode", "gemv"), "gemv")) {
+      double bytes = (double)GB_FP16_GEMV_M * GB_FP16_GEMV_K + (double)GB_FP16_GEMV_K * 2.0 +
+                     (double)GB_FP16_GEMV_M * 4.0;
+      double flops = 2.0 * (double)GB_FP16_GEMV_M * (double)GB_FP16_GEMV_K;
+      gb_derive_rate(r, "gbps", "GB/s", us, bytes / 1e3);
+      gb_derive_rate(r, "gflops", "GFLOP/s", us, flops / 1e3);
+   } else {
+      gb_derive_rate(r, "gflops", "GFLOP/s", us, GB_FP16_ALUMIX_FLOP / 1e3);
+   }
+}
+
+static void
+fp16_check(id state, struct gb_check *chk)
+{
+   GBFp16State *st = state;
+   size_t bytes = st.gemv ? (size_t)GB_FP16_GEMV_M * sizeof(float)
+                          : (size_t)GB_FP16_ALUMIX_GROUPS * GB_FP16_ALUMIX_LOCAL * sizeof(float);
+   void *got = malloc(bytes);
+   mtl_buf_readback(st.outBuf, got, bytes);
+   mtl_set_crc_check(chk, gb_crc32(got, bytes), st.expectedCrc);
+   free(got);
+}
+
+static const char *const fp16_params[] = {"mode", NULL};
+static const struct mtest t_compute_fp16 = {
+   .name = "compute.fp16", .known = fp16_params, .depths = {1, 4}, .nd = 2,
+   .setup = fp16_setup, .encode = fp16_encode, .derive = fp16_derive, .check = fp16_check,
+};
+
+/* ---- W2.5 transfer.ops ---- */
+
+@interface GBXferState : NSObject
+@property(nonatomic) int kind;
+@property(nonatomic) uint32_t w, h, mips, expectedCrc;
+@property(nonatomic, strong) id<MTLBuffer> staging;
+@property(nonatomic, strong) id<MTLTexture> tex;
+@end
+@implementation GBXferState @end
+
+static id
+xfer_setup(const struct gb_opts *o, char *err, size_t n)
+{
+   const char *k = gb_param(o, "kind", "clear_4m");
+   GBXferState *st = [GBXferState new];
+   if (!strcmp(k, "clear_4m")) {
+      st.kind = 0; st.w = GB_XFER_4M_DIM; st.h = GB_XFER_4M_DIM; st.mips = 1;
+      st.expectedCrc = gb_transfer_clear_ref_crc(st.w, st.h);
+   } else if (!strcmp(k, "clear_16m")) {
+      st.kind = 1; st.w = GB_XFER_16M_DIM; st.h = GB_XFER_16M_DIM; st.mips = 1;
+      st.expectedCrc = gb_transfer_clear_ref_crc(st.w, st.h);
+   } else if (!strcmp(k, "copy_b2i")) {
+      st.kind = 2; st.w = GB_XFER_16M_DIM; st.h = GB_XFER_16M_DIM; st.mips = 1;
+      size_t bytes = (size_t)st.w * st.h * 4u;
+      st.staging = buf_tracked(bytes, true);
+      gb_transfer_fill_rgba(st.w, st.h, st.staging.contents);
+      st.expectedCrc = gb_crc32(st.staging.contents, bytes);
+   } else if (!strcmp(k, "mipchain")) {
+      st.kind = 3; st.w = GB_XFER_MIP_W; st.h = GB_XFER_MIP_H; st.mips = GB_XFER_MIP_LEVELS;
+   } else {
+      snprintf(err, n, "kind must be clear_4m, clear_16m, copy_b2i or mipchain");
+      return nil;
+   }
+   MTLTextureDescriptor *td = [MTLTextureDescriptor texture2DDescriptorWithPixelFormat:MTLPixelFormatRGBA8Unorm
+                                                                                 width:st.w
+                                                                                height:st.h
+                                                                             mipmapped:(st.mips > 1)];
+   td.mipmapLevelCount = st.mips;
+   td.storageMode = MTLStorageModePrivate;
+   td.usage = MTLTextureUsageRenderTarget | MTLTextureUsageShaderRead;
+   td.hazardTrackingMode = MTLHazardTrackingModeTracked;
+   st.tex = [g_dev newTextureWithDescriptor:td];
+   if (!st.tex) gb_die("transfer.ops texture failed");
+   if (st.kind == 3) {
+      size_t bytes = (size_t)st.w * st.h * 4u;
+      id<MTLBuffer> up = buf_tracked(bytes, true);
+      gb_transfer_fill_mip0(st.w, st.h, up.contents);
+      id<MTLCommandQueue> q = new_queue(2);
+      id<MTLCommandBuffer> cb = [q commandBuffer];
+      id<MTLBlitCommandEncoder> b = [cb blitCommandEncoder];
+      [b copyFromBuffer:up sourceOffset:0 sourceBytesPerRow:(size_t)st.w * 4u
+       sourceBytesPerImage:bytes sourceSize:MTLSizeMake(st.w, st.h, 1)
+                 toTexture:st.tex destinationSlice:0 destinationLevel:0 destinationOrigin:MTLOriginMake(0, 0, 0)];
+      [b endEncoding];
+      [cb commit];
+      [cb waitUntilCompleted];
+   }
+   return st;
+}
+
+static void
+xfer_encode(id state, id<MTLCommandBuffer> cb, uint64_t k)
+{
+   (void)k;
+   GBXferState *st = state;
+   if (st.kind <= 1) {
+      MTLRenderPassDescriptor *rp = [MTLRenderPassDescriptor renderPassDescriptor];
+      rp.colorAttachments[0].texture = st.tex;
+      rp.colorAttachments[0].loadAction = MTLLoadActionClear;
+      rp.colorAttachments[0].storeAction = MTLStoreActionStore;
+      rp.colorAttachments[0].clearColor = MTLClearColorMake(192.0 / 255.0, 128.0 / 255.0, 64.0 / 255.0, 1.0);
+      id<MTLRenderCommandEncoder> e = [cb renderCommandEncoderWithDescriptor:rp];
+      [e endEncoding];
+   } else if (st.kind == 2) {
+      id<MTLBlitCommandEncoder> b = [cb blitCommandEncoder];
+      size_t row = (size_t)st.w * 4u;
+      [b copyFromBuffer:st.staging sourceOffset:0 sourceBytesPerRow:row
+       sourceBytesPerImage:row * st.h sourceSize:MTLSizeMake(st.w, st.h, 1)
+                 toTexture:st.tex destinationSlice:0 destinationLevel:0 destinationOrigin:MTLOriginMake(0, 0, 0)];
+      [b endEncoding];
+   } else {
+      id<MTLBlitCommandEncoder> b = [cb blitCommandEncoder];
+      [b generateMipmapsForTexture:st.tex];
+      [b endEncoding];
+   }
+}
+
+static void
+xfer_derive(const struct gb_opts *o, struct gb_result *r, const struct gb_samples *us)
+{
+   const char *k = gb_param(o, "kind", "clear_4m");
+   double bytes = 0.0;
+   if (!strcmp(k, "clear_4m")) bytes = (double)GB_XFER_4M_DIM * GB_XFER_4M_DIM * 4.0;
+   else if (!strcmp(k, "clear_16m") || !strcmp(k, "copy_b2i"))
+      bytes = (double)GB_XFER_16M_DIM * GB_XFER_16M_DIM * 4.0;
+   else {
+      uint32_t mw = GB_XFER_MIP_W, mh = GB_XFER_MIP_H;
+      for (uint32_t i = 1; i < GB_XFER_MIP_LEVELS; i++) {
+         uint32_t nw = mw > 1 ? mw / 2 : 1, nh = mh > 1 ? mh / 2 : 1;
+         bytes += ((double)mw * mh + (double)nw * nh) * 4.0;
+         mw = nw; mh = nh;
+      }
+   }
+   gb_derive_rate(r, "gbps", "GB/s", us, bytes / 1e3);
+}
+
+static void
+xfer_check(id state, struct gb_check *chk)
+{
+   GBXferState *st = state;
+   if (st.kind != 3) {
+      size_t bytes = (size_t)st.w * st.h * 4u;
+      uint8_t *got = malloc(bytes);
+      mtl_tex_readback(st.tex, got, st.w, st.h, 4u);
+      mtl_set_crc_check(chk, gb_crc32(got, bytes), st.expectedCrc);
+      free(got);
+   } else {
+      uint32_t m4w = st.w >> 4, m4h = st.h >> 4;
+      size_t b4_bytes = (size_t)m4w * m4h * 4u;
+      id<MTLBuffer> b4 = buf_tracked(b4_bytes, true);
+      id<MTLBuffer> bl = buf_tracked(16, true);
+      id<MTLCommandQueue> q = new_queue(2);
+      id<MTLCommandBuffer> cb = [q commandBuffer];
+      id<MTLBlitCommandEncoder> b = [cb blitCommandEncoder];
+      [b copyFromTexture:st.tex sourceSlice:0 sourceLevel:4 sourceOrigin:MTLOriginMake(0, 0, 0)
+              sourceSize:MTLSizeMake(m4w, m4h, 1) toBuffer:b4 destinationOffset:0
+       destinationBytesPerRow:(size_t)m4w * 4u destinationBytesPerImage:b4_bytes];
+      [b copyFromTexture:st.tex sourceSlice:0 sourceLevel:(st.mips - 1u) sourceOrigin:MTLOriginMake(0, 0, 0)
+              sourceSize:MTLSizeMake(1, 1, 1) toBuffer:bl destinationOffset:0
+       destinationBytesPerRow:4 destinationBytesPerImage:4];
+      [b endEncoding];
+      [cb commit];
+      [cb waitUntilCompleted];
+      gb_transfer_check_mipchain(b4.contents, m4w, m4h, bl.contents, chk);
+   }
+}
+
+static const char *const xfer_params[] = {"kind", NULL};
+static const struct mtest t_transfer_ops = {
+   .name = "transfer.ops", .known = xfer_params, .depths = {1, 4}, .nd = 2,
+   .setup = xfer_setup, .encode = xfer_encode, .derive = xfer_derive, .check = xfer_check,
+};
+
+/* ---- W2.6 render.postfx ---- */
+
+@interface GBPostfxState : NSObject
+@property(nonatomic) uint32_t w, h, msaa;
+@property(nonatomic, strong) id<MTLTexture> hdrMs, hdrRes, depthMs, finalTex;
+@property(nonatomic, strong) NSArray<id<MTLTexture>> *bloom;
+@property(nonatomic, strong) id<MTLSamplerState> linSampler;
+@property(nonatomic, strong) id<MTLDepthStencilState> dsLess;
+@property(nonatomic, strong) id<MTLRenderPipelineState> pScene, pDown, pUp, pTone;
+@end
+@implementation GBPostfxState @end
+
+static id
+postfx_setup(const struct gb_opts *o, char *err, size_t n)
+{
+   uint32_t w = 0, h = 0;
+   if (!parse_res(gb_param(o, "res", "1440p"), &w, &h)) {
+      snprintf(err, n, "res must be 720p, 1080p, 1440p or 2160p");
+      return nil;
+   }
+   long msaa = gb_param_int(o, "msaa", 4);
+   if (msaa != 1 && msaa != 4) {
+      snprintf(err, n, "msaa must be 1 or 4");
+      return nil;
+   }
+   GBPostfxState *st = [GBPostfxState new];
+   st.w = w; st.h = h; st.msaa = (uint32_t)msaa;
+   if (msaa == 4)
+      st.hdrMs = tex_ex_opt(w, h, MTLPixelFormatRGBA16Float, 4, MTLTextureUsageRenderTarget, true, false);
+   st.hdrRes = tex_ex_opt(w, h, MTLPixelFormatRGBA16Float, 1,
+                          MTLTextureUsageRenderTarget | MTLTextureUsageShaderRead, false, true);
+   st.depthMs = tex_ex_opt(w, h, MTLPixelFormatDepth32Float, (uint32_t)msaa, MTLTextureUsageRenderTarget, true, false);
+   NSMutableArray<id<MTLTexture>> *bloom = [NSMutableArray arrayWithCapacity:GB_POSTFX_BLOOM_MIPS];
+   uint32_t bw = w, bh = h;
+   for (uint32_t i = 0; i < GB_POSTFX_BLOOM_MIPS; i++) {
+      bw = bw > 1 ? bw / 2 : 1;
+      bh = bh > 1 ? bh / 2 : 1;
+      [bloom addObject:tex_ex_opt(bw, bh, MTLPixelFormatRGBA16Float, 1,
+                                  MTLTextureUsageRenderTarget | MTLTextureUsageShaderRead, false, true)];
+   }
+   st.bloom = bloom;
+   st.finalTex = tex_ex_opt(w, h, MTLPixelFormatRGBA8Unorm, 1,
+                            MTLTextureUsageRenderTarget | MTLTextureUsageShaderRead, false, true);
+
+   MTLSamplerDescriptor *sd = [MTLSamplerDescriptor new];
+   sd.minFilter = MTLSamplerMinMagFilterLinear;
+   sd.magFilter = MTLSamplerMinMagFilterLinear;
+   sd.sAddressMode = MTLSamplerAddressModeClampToEdge;
+   sd.tAddressMode = MTLSamplerAddressModeClampToEdge;
+   st.linSampler = [g_dev newSamplerStateWithDescriptor:sd];
+
+   MTLDepthStencilDescriptor *dsd = [MTLDepthStencilDescriptor new];
+   dsd.depthCompareFunction = MTLCompareFunctionLess;
+   dsd.depthWriteEnabled = YES;
+   st.dsLess = [g_dev newDepthStencilStateWithDescriptor:dsd];
+
+   NSError *merr = nil;
+   MTLRenderPipelineDescriptor *sp = [MTLRenderPipelineDescriptor new];
+   sp.vertexFunction = [g_lib newFunctionWithName:@"postfx_scene_vert"];
+   sp.fragmentFunction = [g_lib newFunctionWithName:@"postfx_scene_frag"];
+   sp.rasterSampleCount = st.msaa;
+   sp.colorAttachments[0].pixelFormat = MTLPixelFormatRGBA16Float;
+   sp.depthAttachmentPixelFormat = MTLPixelFormatDepth32Float;
+   st.pScene = [g_dev newRenderPipelineStateWithDescriptor:sp error:&merr];
+   if (!st.pScene) gb_die("postfx scene pipe failed: %s", merr.localizedDescription.UTF8String);
+
+   MTLRenderPipelineDescriptor *dp = [MTLRenderPipelineDescriptor new];
+   dp.vertexFunction = [g_lib newFunctionWithName:@"fs_vert"];
+   dp.fragmentFunction = [g_lib newFunctionWithName:@"postfx_down_frag"];
+   dp.colorAttachments[0].pixelFormat = MTLPixelFormatRGBA16Float;
+   st.pDown = [g_dev newRenderPipelineStateWithDescriptor:dp error:&merr];
+   if (!st.pDown) gb_die("postfx down pipe failed: %s", merr.localizedDescription.UTF8String);
+
+   MTLRenderPipelineDescriptor *up = [MTLRenderPipelineDescriptor new];
+   up.vertexFunction = [g_lib newFunctionWithName:@"fs_vert"];
+   up.fragmentFunction = [g_lib newFunctionWithName:@"postfx_up_frag"];
+   up.colorAttachments[0].pixelFormat = MTLPixelFormatRGBA16Float;
+   up.colorAttachments[0].blendingEnabled = YES;
+   up.colorAttachments[0].sourceRGBBlendFactor = MTLBlendFactorOne;
+   up.colorAttachments[0].destinationRGBBlendFactor = MTLBlendFactorOne;
+   up.colorAttachments[0].rgbBlendOperation = MTLBlendOperationAdd;
+   up.colorAttachments[0].sourceAlphaBlendFactor = MTLBlendFactorOne;
+   up.colorAttachments[0].destinationAlphaBlendFactor = MTLBlendFactorZero;
+   up.colorAttachments[0].alphaBlendOperation = MTLBlendOperationAdd;
+   st.pUp = [g_dev newRenderPipelineStateWithDescriptor:up error:&merr];
+   if (!st.pUp) gb_die("postfx up pipe failed: %s", merr.localizedDescription.UTF8String);
+
+   MTLRenderPipelineDescriptor *tp = [MTLRenderPipelineDescriptor new];
+   tp.vertexFunction = [g_lib newFunctionWithName:@"fs_vert"];
+   tp.fragmentFunction = [g_lib newFunctionWithName:@"postfx_tonemap_frag"];
+   tp.colorAttachments[0].pixelFormat = MTLPixelFormatRGBA8Unorm;
+   st.pTone = [g_dev newRenderPipelineStateWithDescriptor:tp error:&merr];
+   if (!st.pTone) gb_die("postfx tone pipe failed: %s", merr.localizedDescription.UTF8String);
+   return st;
+}
+
+static void
+postfx_encode(id state, id<MTLCommandBuffer> cb, uint64_t k)
+{
+   (void)k;
+   GBPostfxState *st = state;
+   MTLRenderPassDescriptor *rp = [MTLRenderPassDescriptor renderPassDescriptor];
+   if (st.msaa == 4u) {
+      rp.colorAttachments[0].texture = st.hdrMs;
+      rp.colorAttachments[0].resolveTexture = st.hdrRes;
+      rp.colorAttachments[0].storeAction = MTLStoreActionMultisampleResolve;
+   } else {
+      rp.colorAttachments[0].texture = st.hdrRes;
+      rp.colorAttachments[0].storeAction = MTLStoreActionStore;
+   }
+   rp.colorAttachments[0].loadAction = MTLLoadActionClear;
+   rp.colorAttachments[0].clearColor = MTLClearColorMake(0.04, 0.05, 0.08, 1.0);
+   rp.depthAttachment.texture = st.depthMs;
+   rp.depthAttachment.loadAction = MTLLoadActionClear;
+   rp.depthAttachment.storeAction = MTLStoreActionDontCare;
+   rp.depthAttachment.clearDepth = 1.0;
+   id<MTLRenderCommandEncoder> e = [cb renderCommandEncoderWithDescriptor:rp];
+   [e setRenderPipelineState:st.pScene];
+   [e setDepthStencilState:st.dsLess];
+   [e drawPrimitives:MTLPrimitiveTypeTriangle vertexStart:0 vertexCount:GB_POSTFX_QUADS * 6u];
+   [e endEncoding];
+
+   for (uint32_t i = 0; i < GB_POSTFX_BLOOM_MIPS; i++) {
+      id<MTLTexture> dst = st.bloom[i];
+      id<MTLTexture> src = (i == 0) ? st.hdrRes : st.bloom[i - 1u];
+      MTLRenderPassDescriptor *drp = [MTLRenderPassDescriptor renderPassDescriptor];
+      drp.colorAttachments[0].texture = dst;
+      drp.colorAttachments[0].loadAction = MTLLoadActionDontCare;
+      drp.colorAttachments[0].storeAction = MTLStoreActionStore;
+      id<MTLRenderCommandEncoder> de = [cb renderCommandEncoderWithDescriptor:drp];
+      [de setRenderPipelineState:st.pDown];
+      [de setFragmentTexture:src atIndex:0];
+      [de setFragmentSamplerState:st.linSampler atIndex:0];
+      struct { float iw, ih, siw, sih; uint32_t bp; } pc = {
+         1.0f / (float)dst.width, 1.0f / (float)dst.height,
+         1.0f / (float)src.width, 1.0f / (float)src.height, i == 0 ? 1u : 0u
+      };
+      [de setFragmentBytes:&pc length:sizeof(pc) atIndex:0];
+      [de drawPrimitives:MTLPrimitiveTypeTriangle vertexStart:0 vertexCount:3];
+      [de endEncoding];
+   }
+
+   for (int i = (int)GB_POSTFX_BLOOM_MIPS - 2; i >= 0; i--) {
+      id<MTLTexture> dst = st.bloom[i];
+      id<MTLTexture> src = st.bloom[i + 1];
+      MTLRenderPassDescriptor *urp = [MTLRenderPassDescriptor renderPassDescriptor];
+      urp.colorAttachments[0].texture = dst;
+      urp.colorAttachments[0].loadAction = MTLLoadActionLoad;
+      urp.colorAttachments[0].storeAction = MTLStoreActionStore;
+      id<MTLRenderCommandEncoder> ue = [cb renderCommandEncoderWithDescriptor:urp];
+      [ue setRenderPipelineState:st.pUp];
+      [ue setFragmentTexture:src atIndex:0];
+      [ue setFragmentSamplerState:st.linSampler atIndex:0];
+      float pc[4] = {1.0f / (float)dst.width, 1.0f / (float)dst.height,
+                     1.0f / (float)src.width, 1.0f / (float)src.height};
+      [ue setFragmentBytes:pc length:sizeof(pc) atIndex:0];
+      [ue drawPrimitives:MTLPrimitiveTypeTriangle vertexStart:0 vertexCount:3];
+      [ue endEncoding];
+   }
+
+   MTLRenderPassDescriptor *trp = [MTLRenderPassDescriptor renderPassDescriptor];
+   trp.colorAttachments[0].texture = st.finalTex;
+   trp.colorAttachments[0].loadAction = MTLLoadActionDontCare;
+   trp.colorAttachments[0].storeAction = MTLStoreActionStore;
+   id<MTLRenderCommandEncoder> te = [cb renderCommandEncoderWithDescriptor:trp];
+   [te setRenderPipelineState:st.pTone];
+   [te setFragmentTexture:st.hdrRes atIndex:0];
+   [te setFragmentTexture:st.bloom[0] atIndex:1];
+   [te setFragmentSamplerState:st.linSampler atIndex:0];
+   float tpc[2] = {1.0f / (float)st.w, 1.0f / (float)st.h};
+   [te setFragmentBytes:tpc length:sizeof(tpc) atIndex:0];
+   [te drawPrimitives:MTLPrimitiveTypeTriangle vertexStart:0 vertexCount:3];
+   [te endEncoding];
+}
+
+static void
+postfx_derive(const struct gb_opts *o, struct gb_result *r, const struct gb_samples *us)
+{
+   uint32_t w = 2560, h = 1440;
+   parse_res(gb_param(o, "res", "1440p"), &w, &h);
+   gb_derive_rate(r, "fps", "fps", us, 1e6);
+   gb_derive_rate(r, "gpix_s", "Gpix/s", us, (double)w * h / 1e3);
+}
+
+static void
+postfx_check(id state, struct gb_check *chk)
+{
+   GBPostfxState *st = state;
+   uint8_t *got = malloc((size_t)st.w * st.h * 4u);
+   mtl_tex_readback(st.finalTex, got, st.w, st.h, 4u);
+   gb_postfx_check_fb(got, st.w, st.h, chk);
+   free(got);
+}
+
+static const char *const postfx_params[] = {"res", "msaa", NULL};
+static const struct mtest t_render_postfx = {
+   .name = "render.postfx", .known = postfx_params, .depths = {1, 2}, .nd = 2,
+   .setup = postfx_setup, .encode = postfx_encode, .derive = postfx_derive, .check = postfx_check,
+};
+
 /* ======================= table ======================= */
 
 static int st_empty(const struct gb_opts *o) { return run_stream_test(o, &t_submit_empty); }
@@ -3076,6 +3968,12 @@ static int st_edge(const struct gb_opts *o) { return run_stream_test(o, &t_compu
 static int st_deferred(const struct gb_opts *o) { return run_stream_test(o, &t_render_deferred); }
 static int st_mdi(const struct gb_opts *o) { return run_stream_test(o, &t_render_mdi); }
 static int st_cmp(const struct gb_opts *o) { return run_stream_test(o, &t_compress_bw); }
+static int st_shadow(const struct gb_opts *o) { return run_stream_test(o, &t_render_shadow); }
+static int st_cull_mdi(const struct gb_opts *o) { return run_stream_test(o, &t_compute_cull_mdi); }
+static int st_bubo(const struct gb_opts *o) { return run_stream_test(o, &t_render_bindless_ubo); }
+static int st_fp16(const struct gb_opts *o) { return run_stream_test(o, &t_compute_fp16); }
+static int st_xfer(const struct gb_opts *o) { return run_stream_test(o, &t_transfer_ops); }
+static int st_postfx(const struct gb_opts *o) { return run_stream_test(o, &t_render_postfx); }
 
 static const struct {
    const char *name;
@@ -3106,6 +4004,13 @@ static const struct {
    {"compile.pso", run_compile_pso},
    {"compress.bw", st_cmp},
    {"overlap.passes", run_overlap_passes},
+   /* 90%-coverage Wave-2 heavy-game / AAA benchmarks */
+   {"render.shadow", st_shadow},
+   {"compute.cull_mdi", st_cull_mdi},
+   {"render.bindless_ubo", st_bubo},
+   {"compute.fp16", st_fp16},
+   {"transfer.ops", st_xfer},
+   {"render.postfx", st_postfx},
    {NULL, NULL},
 };
 

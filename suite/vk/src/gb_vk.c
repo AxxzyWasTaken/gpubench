@@ -85,12 +85,59 @@ gb_vk_create(struct gb_vk *vk, int device_index, int nqueues)
    vk->qfam = pick_family(vk->pdev, &vk->family_queue_count);
 
    VkPhysicalDeviceDriverProperties drv = {.sType = VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_DRIVER_PROPERTIES};
-   VkPhysicalDeviceProperties2 p2 = {.sType = VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_PROPERTIES_2, .pNext = &drv};
+   VkPhysicalDeviceSubgroupProperties subp = {
+      .sType = VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_SUBGROUP_PROPERTIES,
+      .pNext = &drv,
+   };
+#ifdef VK_EXT_descriptor_buffer
+   VkPhysicalDeviceDescriptorBufferPropertiesEXT dbp = {
+      .sType = VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_DESCRIPTOR_BUFFER_PROPERTIES_EXT,
+      .pNext = &subp,
+   };
+#endif
+   /* Probe device extensions before querying optional property structs. */
+   uint32_t nexts = 0;
+   vkEnumerateDeviceExtensionProperties(vk->pdev, NULL, &nexts, NULL);
+   VkExtensionProperties *extp = nexts ? calloc(nexts, sizeof(*extp)) : NULL;
+   if (nexts)
+      vkEnumerateDeviceExtensionProperties(vk->pdev, NULL, &nexts, extp);
+   bool ext_local_read = false, ext_pipe_stats = false, ext_desc_buf = false;
+   for (uint32_t i = 0; i < nexts; i++) {
+      if (!strcmp(extp[i].extensionName, VK_KHR_DYNAMIC_RENDERING_LOCAL_READ_EXTENSION_NAME))
+         ext_local_read = true;
+      if (!strcmp(extp[i].extensionName, VK_KHR_PIPELINE_EXECUTABLE_PROPERTIES_EXTENSION_NAME))
+         ext_pipe_stats = true;
+#ifdef VK_EXT_descriptor_buffer
+      if (!strcmp(extp[i].extensionName, VK_EXT_DESCRIPTOR_BUFFER_EXTENSION_NAME))
+         ext_desc_buf = true;
+#endif
+   }
+   free(extp);
+
+   VkPhysicalDeviceProperties2 p2 = {
+      .sType = VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_PROPERTIES_2,
+#ifdef VK_EXT_descriptor_buffer
+      .pNext = ext_desc_buf ? (void *)&dbp : (void *)&subp,
+#else
+      .pNext = &subp,
+#endif
+   };
    vkGetPhysicalDeviceProperties2(vk->pdev, &p2);
    vk->props = p2.properties;
    snprintf(vk->driver_name, sizeof(vk->driver_name), "%s", drv.driverName);
    snprintf(vk->driver_info, sizeof(vk->driver_info), "%s", drv.driverInfo);
    vk->ts_period_ns = vk->props.limits.timestampPeriod;
+   vk->subgroup_size = subp.subgroupSize;
+   vk->has_subgroup_ballot = (subp.supportedOperations & VK_SUBGROUP_FEATURE_BALLOT_BIT) != 0 &&
+                             (subp.supportedStages & VK_SHADER_STAGE_COMPUTE_BIT) != 0;
+   vk->has_subgroup_arithmetic = (subp.supportedOperations & VK_SUBGROUP_FEATURE_ARITHMETIC_BIT) != 0 &&
+                                 (subp.supportedStages & VK_SHADER_STAGE_COMPUTE_BIT) != 0;
+#ifdef VK_EXT_descriptor_buffer
+   if (ext_desc_buf) {
+      vk->desc_buf_offset_align = dbp.descriptorBufferOffsetAlignment;
+      vk->ubo_desc_size = dbp.uniformBufferDescriptorSize;
+   }
+#endif
    vkGetPhysicalDeviceMemoryProperties(vk->pdev, &vk->memprops);
 
    uint32_t nq;
@@ -115,24 +162,25 @@ gb_vk_create(struct gb_vk *vk, int device_index, int nqueues)
    VkPhysicalDeviceDynamicRenderingLocalReadFeaturesKHR flr = {
       .sType = VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_DYNAMIC_RENDERING_LOCAL_READ_FEATURES_KHR,
    };
+#ifdef VK_EXT_descriptor_buffer
+   VkPhysicalDeviceDescriptorBufferFeaturesEXT fdb = {
+      .sType = VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_DESCRIPTOR_BUFFER_FEATURES_EXT,
+   };
+#endif
    VkPhysicalDeviceFeatures2 f2 = {.sType = VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_FEATURES_2, .pNext = &f11};
-
-   /* Probe device extensions for optional capabilities. */
-   uint32_t nexts = 0;
-   vkEnumerateDeviceExtensionProperties(vk->pdev, NULL, &nexts, NULL);
-   VkExtensionProperties *extp = nexts ? calloc(nexts, sizeof(*extp)) : NULL;
-   if (nexts)
-      vkEnumerateDeviceExtensionProperties(vk->pdev, NULL, &nexts, extp);
-   bool ext_local_read = false, ext_pipe_stats = false;
-   for (uint32_t i = 0; i < nexts; i++) {
-      if (!strcmp(extp[i].extensionName, VK_KHR_DYNAMIC_RENDERING_LOCAL_READ_EXTENSION_NAME))
-         ext_local_read = true;
-      if (!strcmp(extp[i].extensionName, VK_KHR_PIPELINE_EXECUTABLE_PROPERTIES_EXTENSION_NAME))
-         ext_pipe_stats = true;
+   void **ftail = &f13.pNext;
+   if (ext_local_read) {
+      *ftail = &flr;
+      ftail = &flr.pNext;
    }
-   free(extp);
-   if (ext_local_read)
-      f13.pNext = &flr;
+#ifdef VK_EXT_descriptor_buffer
+   if (ext_desc_buf) {
+      *ftail = &fdb;
+      ftail = &fdb.pNext;
+   }
+#else
+   (void)ext_desc_buf;
+#endif
 
    vkGetPhysicalDeviceFeatures2(vk->pdev, &f2);
    if (!f12.timelineSemaphore || !f12.hostQueryReset || !f13.synchronization2 || !f13.dynamicRendering)
@@ -143,6 +191,10 @@ gb_vk_create(struct gb_vk *vk, int device_index, int nqueues)
    vk->has_descriptor_indexing =
       f12.descriptorIndexing && f12.runtimeDescriptorArray && f12.shaderSampledImageArrayNonUniformIndexing;
    vk->has_float16 = f12.shaderFloat16;
+   vk->has_buffer_device_address = f12.bufferDeviceAddress;
+#ifdef VK_EXT_descriptor_buffer
+   vk->has_descriptor_buffer = ext_desc_buf && fdb.descriptorBuffer && vk->has_buffer_device_address;
+#endif
    vk->max_sampled_images = vk->props.limits.maxPerStageDescriptorSampledImages;
 
    VkPhysicalDeviceVulkan13Features e13 = {.sType = VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_VULKAN_1_3_FEATURES,
@@ -157,7 +209,10 @@ gb_vk_create(struct gb_vk *vk, int device_index, int nqueues)
       .descriptorIndexing = vk->has_descriptor_indexing ? VK_TRUE : VK_FALSE,
       .runtimeDescriptorArray = vk->has_descriptor_indexing ? VK_TRUE : VK_FALSE,
       .shaderSampledImageArrayNonUniformIndexing = vk->has_descriptor_indexing ? VK_TRUE : VK_FALSE,
+      .shaderUniformBufferArrayNonUniformIndexing =
+         (vk->has_descriptor_indexing && f12.shaderUniformBufferArrayNonUniformIndexing) ? VK_TRUE : VK_FALSE,
       .shaderFloat16 = vk->has_float16 ? VK_TRUE : VK_FALSE,
+      .bufferDeviceAddress = vk->has_buffer_device_address ? VK_TRUE : VK_FALSE,
    };
    VkPhysicalDeviceVulkan11Features e11 = {
       .sType = VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_VULKAN_1_1_FEATURES,
@@ -172,12 +227,20 @@ gb_vk_create(struct gb_vk *vk, int device_index, int nqueues)
       .sType = VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_PIPELINE_EXECUTABLE_PROPERTIES_FEATURES_KHR,
       .pipelineExecutableInfo = VK_TRUE,
    };
+#ifdef VK_EXT_descriptor_buffer
+   VkPhysicalDeviceDescriptorBufferFeaturesEXT edb = {
+      .sType = VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_DESCRIPTOR_BUFFER_FEATURES_EXT,
+      .descriptorBuffer = VK_TRUE,
+   };
+#endif
    VkPhysicalDeviceFeatures2 e2 = {.sType = VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_FEATURES_2, .pNext = &e11};
    if (f2.features.multiDrawIndirect)
       e2.features.multiDrawIndirect = VK_TRUE;
    if (f2.features.sampleRateShading)
       e2.features.sampleRateShading = VK_TRUE;
-   const char *exts[4];
+   if (f2.features.shaderUniformBufferArrayDynamicIndexing)
+      e2.features.shaderUniformBufferArrayDynamicIndexing = VK_TRUE;
+   const char *exts[8];
    uint32_t enabled_exts = 0;
    void **tail = &e13.pNext;
    if (gb_vk_want_pipeline_stats && ext_pipe_stats) {
@@ -190,6 +253,13 @@ gb_vk_create(struct gb_vk *vk, int device_index, int nqueues)
       tail = &elr.pNext;
       exts[enabled_exts++] = VK_KHR_DYNAMIC_RENDERING_LOCAL_READ_EXTENSION_NAME;
    }
+#ifdef VK_EXT_descriptor_buffer
+   if (vk->has_descriptor_buffer) {
+      *tail = &edb;
+      tail = &edb.pNext;
+      exts[enabled_exts++] = VK_EXT_DESCRIPTOR_BUFFER_EXTENSION_NAME;
+   }
+#endif
 
    float prio[GB_MAX_QUEUES];
    for (int i = 0; i < GB_MAX_QUEUES; i++)
@@ -225,6 +295,23 @@ gb_vk_create(struct gb_vk *vk, int device_index, int nqueues)
       if (!vk->cmd_set_attachment_locations || !vk->cmd_set_input_attachment_indices)
          vk->has_local_read = false;
    }
+#ifdef VK_EXT_descriptor_buffer
+   if (vk->has_descriptor_buffer) {
+      vk->get_dsl_size =
+         (PFN_vkGetDescriptorSetLayoutSizeEXT)vkGetDeviceProcAddr(vk->dev, "vkGetDescriptorSetLayoutSizeEXT");
+      vk->get_dsl_binding_offset =
+         (PFN_vkGetDescriptorSetLayoutBindingOffsetEXT)vkGetDeviceProcAddr(vk->dev, "vkGetDescriptorSetLayoutBindingOffsetEXT");
+      vk->get_descriptor =
+         (PFN_vkGetDescriptorEXT)vkGetDeviceProcAddr(vk->dev, "vkGetDescriptorEXT");
+      vk->cmd_bind_desc_bufs =
+         (PFN_vkCmdBindDescriptorBuffersEXT)vkGetDeviceProcAddr(vk->dev, "vkCmdBindDescriptorBuffersEXT");
+      vk->cmd_set_desc_buf_offsets =
+         (PFN_vkCmdSetDescriptorBufferOffsetsEXT)vkGetDeviceProcAddr(vk->dev, "vkCmdSetDescriptorBufferOffsetsEXT");
+      if (!vk->get_dsl_size || !vk->get_dsl_binding_offset || !vk->get_descriptor ||
+          !vk->cmd_bind_desc_bufs || !vk->cmd_set_desc_buf_offsets || !vk->ubo_desc_size)
+         vk->has_descriptor_buffer = false;
+   }
+#endif
 
    /* memory types */
    vk->mem_host = vk->mem_dev = UINT32_MAX;
@@ -330,8 +417,14 @@ gb_buf_create(struct gb_vk *vk, VkDeviceSize size, VkBufferUsageFlags usage, boo
    GB_VK_CHECK(vkCreateBuffer(vk->dev, &ci, NULL, &b->buf));
    VkMemoryRequirements req;
    vkGetBufferMemoryRequirements(vk->dev, b->buf, &req);
+   VkMemoryAllocateFlagsInfo afi = {
+      .sType = VK_STRUCTURE_TYPE_MEMORY_ALLOCATE_FLAGS_INFO,
+      .flags = VK_MEMORY_ALLOCATE_DEVICE_ADDRESS_BIT,
+   };
+   bool need_addr = (usage & VK_BUFFER_USAGE_SHADER_DEVICE_ADDRESS_BIT) != 0;
    VkMemoryAllocateInfo ai = {
       .sType = VK_STRUCTURE_TYPE_MEMORY_ALLOCATE_INFO,
+      .pNext = need_addr ? &afi : NULL,
       .allocationSize = req.size,
       .memoryTypeIndex = mem_type_for(vk, req.memoryTypeBits, host ? vk->mem_host : vk->mem_dev),
    };
@@ -339,6 +432,19 @@ gb_buf_create(struct gb_vk *vk, VkDeviceSize size, VkBufferUsageFlags usage, boo
    GB_VK_CHECK(vkBindBufferMemory(vk->dev, b->buf, b->mem, 0));
    if (host)
       GB_VK_CHECK(vkMapMemory(vk->dev, b->mem, 0, VK_WHOLE_SIZE, 0, &b->map));
+   if (need_addr) {
+      VkBufferDeviceAddressInfo bda = {
+         .sType = VK_STRUCTURE_TYPE_BUFFER_DEVICE_ADDRESS_INFO,
+         .buffer = b->buf,
+      };
+      b->addr = vkGetBufferDeviceAddress(vk->dev, &bda);
+   }
+}
+
+void
+gb_buf_create_addr(struct gb_vk *vk, VkDeviceSize size, VkBufferUsageFlags usage, bool host, struct gb_buf *b)
+{
+   gb_buf_create(vk, size, usage | VK_BUFFER_USAGE_SHADER_DEVICE_ADDRESS_BIT, host, b);
 }
 
 void

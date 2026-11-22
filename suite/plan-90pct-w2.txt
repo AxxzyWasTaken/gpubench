@@ -1,0 +1,35 @@
+# gpubench 90%-coverage Wave-2 heavy-game / AAA surface plan (Vulkan + Metal).
+# Run via: tools/run-suite.sh --api vk --bin build/bin --out <dir> --plans suite/plan-90pct-w2.txt
+# Kept separate from suite/plan.txt so the existing 209-row performance-gate.py
+# reference remains untouched.
+#
+# chunk      lane   test                 arguments
+
+# 1. Cascaded shadow maps: early-Z depth-only vs discard alpha-test foliage + 3x3 PCF
+aaa-shadow   suite  render.shadow        --depths 1,2 --param mode=depth_only --param fmt=d32f --param res=2048 --param inst=2048
+aaa-shadow   suite  render.shadow        --depths 1,2 --param mode=depth_only --param fmt=d16 --param res=2048 --param inst=2048
+aaa-shadow   suite  render.shadow        --depths 1,2 --param mode=alpha_test --param fmt=d32f --param res=2048 --param inst=2048
+
+# 2. GPU-driven culling + subgroup ballot compaction + vkCmdDrawIndexedIndirectCount
+aaa-cull     suite  compute.cull_mdi     --depths 1,2 --param objs=16384 --param visible=25
+aaa-cull     suite  compute.cull_mdi     --depths 1,2 --param objs=16384 --param visible=75
+
+# 3. Dynamic vec4 UBO arrays + VK_EXT_descriptor_buffer + aliased render targets
+aaa-bubo     suite  render.bindless_ubo  --depths 1,2 --param mode=ubo_vec4 --param draws=512
+aaa-bubo     suite  render.bindless_ubo  --depths 1,2 --param mode=ubo_vec4 --param draws=2048
+aaa-bubo     suite  render.bindless_ubo  --depths 1,2 --param mode=desc_buf --param draws=2048
+
+# 4. Mixed FP16/FP32 ML/upscaler compute: u8->fp16 GEMV + packed half4 FFMA
+aaa-fp16     suite  compute.fp16         --depths 1,4 --param mode=gemv
+aaa-fp16     suite  compute.fp16         --depths 1,4 --param mode=alu_mix
+
+# 5. Transfer & image-clear throughput + 1440p full mipmap chain generation
+aaa-xfer     suite  transfer.ops         --depths 1,4 --param kind=clear_4m
+aaa-xfer     suite  transfer.ops         --depths 1,4 --param kind=clear_16m
+aaa-xfer     suite  transfer.ops         --depths 1,4 --param kind=copy_b2i
+aaa-xfer     suite  transfer.ops         --depths 1,2 --param kind=mipchain
+
+# 6. Modern AAA post-processing chain: 4x MSAA RGBA16F HDR -> resolve -> 5-level bloom -> ACES
+aaa-postfx   suite  render.postfx        --depths 1,2 --param res=1080p --param msaa=4
+aaa-postfx   suite  render.postfx        --depths 1,2 --param res=1440p --param msaa=1
+aaa-postfx   suite  render.postfx        --depths 1,2 --param res=1440p --param msaa=4
