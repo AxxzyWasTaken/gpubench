@@ -5,6 +5,41 @@
 
 #include <vulkan/vulkan.h>
 
+/* Compatibility shims for distro Vulkan headers older than 1.3.279 (e.g. Ubuntu
+ * 24.04 libvulkan-dev 1.3.275), which predate VK_KHR_dynamic_rendering_local_read. */
+#ifndef VK_KHR_dynamic_rendering_local_read
+#define VK_KHR_dynamic_rendering_local_read 1
+#define VK_KHR_DYNAMIC_RENDERING_LOCAL_READ_SPEC_VERSION 1
+#define VK_KHR_DYNAMIC_RENDERING_LOCAL_READ_EXTENSION_NAME "VK_KHR_dynamic_rendering_local_read"
+#define VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_DYNAMIC_RENDERING_LOCAL_READ_FEATURES_KHR ((VkStructureType)1000232000)
+#define VK_STRUCTURE_TYPE_RENDERING_ATTACHMENT_LOCATION_INFO_KHR ((VkStructureType)1000232001)
+#define VK_STRUCTURE_TYPE_RENDERING_INPUT_ATTACHMENT_INDEX_INFO_KHR ((VkStructureType)1000232002)
+#define VK_IMAGE_LAYOUT_RENDERING_LOCAL_READ_KHR ((VkImageLayout)1000232000)
+typedef struct VkPhysicalDeviceDynamicRenderingLocalReadFeaturesKHR {
+   VkStructureType sType;
+   void *pNext;
+   VkBool32 dynamicRenderingLocalRead;
+} VkPhysicalDeviceDynamicRenderingLocalReadFeaturesKHR;
+typedef struct VkRenderingAttachmentLocationInfoKHR {
+   VkStructureType sType;
+   const void *pNext;
+   uint32_t colorAttachmentCount;
+   const uint32_t *pColorAttachmentLocations;
+} VkRenderingAttachmentLocationInfoKHR;
+typedef struct VkRenderingInputAttachmentIndexInfoKHR {
+   VkStructureType sType;
+   const void *pNext;
+   uint32_t colorAttachmentCount;
+   const uint32_t *pColorAttachmentInputIndices;
+   const uint32_t *pDepthInputAttachmentIndex;
+   const uint32_t *pStencilInputAttachmentIndex;
+} VkRenderingInputAttachmentIndexInfoKHR;
+typedef void (VKAPI_PTR *PFN_vkCmdSetRenderingAttachmentLocationsKHR)(
+   VkCommandBuffer commandBuffer, const VkRenderingAttachmentLocationInfoKHR *pLocationInfo);
+typedef void (VKAPI_PTR *PFN_vkCmdSetRenderingInputAttachmentIndicesKHR)(
+   VkCommandBuffer commandBuffer, const VkRenderingInputAttachmentIndexInfoKHR *pInputAttachmentIndexInfo);
+#endif
+
 #include "gb_common.h"
 
 #define GB_MAX_QUEUES 16

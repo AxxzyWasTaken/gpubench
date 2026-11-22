@@ -497,20 +497,21 @@ fragment DefGBuf deferred_geom_frag(DefVertOut in [[stage_in]])
    return g;
 }
 
+static constant float3 kDefLDir[4] = {
+   float3( 0.57735027f,  0.57735027f, 0.57735027f),
+   float3(-0.53452248f,  0.26726124f, 0.80178373f),
+   float3( 0.26726124f, -0.53452248f, 0.80178373f),
+   float3(-0.40824829f, -0.40824829f, 0.81649658f)
+};
+static constant float3 kDefLCol[4] = {
+   float3(0.95f, 0.90f, 0.85f),
+   float3(0.40f, 0.55f, 0.85f),
+   float3(0.75f, 0.45f, 0.30f),
+   float3(0.35f, 0.70f, 0.50f)
+};
+
 static inline float3 deferred_shade(float4 g0, float4 g1, float4 g2, float linz)
 {
-   constant float3 kLDir[4] = {
-      float3( 0.57735027f,  0.57735027f, 0.57735027f),
-      float3(-0.53452248f,  0.26726124f, 0.80178373f),
-      float3( 0.26726124f, -0.53452248f, 0.80178373f),
-      float3(-0.40824829f, -0.40824829f, 0.81649658f)
-   };
-   constant float3 kLCol[4] = {
-      float3(0.95f, 0.90f, 0.85f),
-      float3(0.40f, 0.55f, 0.85f),
-      float3(0.75f, 0.45f, 0.30f),
-      float3(0.35f, 0.70f, 0.50f)
-   };
    float3 albedo = g0.rgb;
    float rough = g0.a;
    float3 n = normalize(g1.xyz);
@@ -521,30 +522,37 @@ static inline float3 deferred_shade(float4 g0, float4 g1, float4 g2, float linz)
    float shin = 8.0f + (1.0f - rough) * 24.0f;
    float atten = 1.0f / (1.0f + linz * linz);
    for (int i = 0; i < 4; i++) {
-      float ndl = max(dot(n, kLDir[i]), 0.0f);
-      float3 h = normalize(kLDir[i] + float3(0.0f, 0.0f, 1.0f));
+      float ndl = max(dot(n, kDefLDir[i]), 0.0f);
+      float3 h = normalize(kDefLDir[i] + float3(0.0f, 0.0f, 1.0f));
       float ndh = max(dot(n, h), 0.0f);
       float spec = pow(ndh, shin) * (0.2f + 0.8f * metal);
       float diff = ndl * (1.0f - 0.5f * metal);
-      col += (albedo * diff + float3(spec)) * kLCol[i] * atten;
+      col += (albedo * diff + float3(spec)) * kDefLCol[i] * atten;
    }
    return clamp(col, 0.0f, 1.0f);
 }
 
 /* On-chip TBDR tile-memory lighting pass (programmable blending [[color(0..3)]]). */
-fragment DefFinalOut deferred_tile_frag(DefGBuf g)
+fragment DefFinalOut deferred_tile_frag(float4 g0 [[color(0)]],
+                                        float4 g1 [[color(1)]],
+                                        float4 g2 [[color(2)]],
+                                        float  g3 [[color(3)]])
 {
    DefFinalOut o;
-   o.col = float4(deferred_shade(g.g0, g.g1, g.g2, g.g3), 1.0f);
+   o.col = float4(deferred_shade(g0, g1, g2, g3), 1.0f);
    return o;
 }
 
 /* On-chip TBDR tile-memory lighting pass (4x MSAA, forced per-sample rate via [[sample_id]]). */
-fragment DefFinalOut deferred_tile_msaa_frag(DefGBuf g, uint sid [[sample_id]])
+fragment DefFinalOut deferred_tile_msaa_frag(float4 g0 [[color(0)]],
+                                             float4 g1 [[color(1)]],
+                                             float4 g2 [[color(2)]],
+                                             float  g3 [[color(3)]],
+                                             uint sid [[sample_id]])
 {
    (void)sid;
    DefFinalOut o;
-   o.col = float4(deferred_shade(g.g0, g.g1, g.g2, g.g3), 1.0f);
+   o.col = float4(deferred_shade(g0, g1, g2, g3), 1.0f);
    return o;
 }
 

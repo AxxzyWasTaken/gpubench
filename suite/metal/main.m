@@ -1621,8 +1621,20 @@ mtl_tex_readback(id<MTLTexture> src, void *dst, uint32_t w, uint32_t h, size_t b
    memcpy(dst, stg.contents, bytes);
 }
 
+static id<MTLBuffer>
+buf_tracked(size_t size, bool host)
+{
+   MTLResourceOptions opts = (host ? MTLResourceStorageModeShared : MTLResourceStorageModePrivate) |
+                             MTLResourceHazardTrackingModeTracked;
+   id<MTLBuffer> b = [g_dev newBufferWithLength:size options:opts];
+   if (!b)
+      gb_die("tracked buffer of %zu bytes failed", size);
+   return b;
+}
+
 static id<MTLTexture>
-tex_ex(uint32_t w, uint32_t h, MTLPixelFormat fmt, NSUInteger samples, MTLStorageMode sm, MTLTextureUsage usage)
+tex_ex_opt(uint32_t w, uint32_t h, MTLPixelFormat fmt, NSUInteger samples, MTLStorageMode sm,
+           MTLTextureUsage usage, bool tracked)
 {
    MTLTextureDescriptor *d = [MTLTextureDescriptor texture2DDescriptorWithPixelFormat:fmt width:w height:h mipmapped:NO];
    if (samples > 1) {
@@ -1631,11 +1643,17 @@ tex_ex(uint32_t w, uint32_t h, MTLPixelFormat fmt, NSUInteger samples, MTLStorag
    }
    d.storageMode = sm;
    d.usage = usage;
-   d.hazardTrackingMode = MTLHazardTrackingModeUntracked;
+   d.hazardTrackingMode = tracked ? MTLHazardTrackingModeTracked : MTLHazardTrackingModeUntracked;
    id<MTLTexture> t = [g_dev newTextureWithDescriptor:d];
    if (!t)
       gb_die("texture %ux%u (samples=%lu) failed", w, h, (unsigned long)samples);
    return t;
+}
+
+static id<MTLTexture>
+tex_ex(uint32_t w, uint32_t h, MTLPixelFormat fmt, NSUInteger samples, MTLStorageMode sm, MTLTextureUsage usage)
+{
+   return tex_ex_opt(w, h, fmt, samples, sm, usage, false);
 }
 
 static id<MTLComputePipelineState>
@@ -1991,7 +2009,7 @@ edge_setup(const struct gb_opts *o, char *err, size_t n)
       st.p2 = cpipe("edge_nms_main");
    } else {
       st.respBuf = buf(bytes, false);
-      st.cntBuf = buf(64, false);
+      st.cntBuf = buf_tracked(64, false);
       st.p2 = cpipe("edge_harris_resp_main");
       st.p3 = cpipe("edge_harris_nms_main");
    }
@@ -2099,10 +2117,11 @@ deferred_make_state(uint32_t w, uint32_t h, uint32_t msaa, bool tile)
    MTLStorageMode gsm = tile ? MTLStorageModeMemoryless : MTLStorageModePrivate;
    MTLTextureUsage gusage = tile ? MTLTextureUsageRenderTarget
                                  : (MTLTextureUsageRenderTarget | MTLTextureUsageShaderRead);
-   st.g0 = tex_ex(w, h, MTLPixelFormatRGBA8Unorm, msaa, gsm, gusage);
-   st.g1 = tex_ex(w, h, MTLPixelFormatRGBA16Float, msaa, gsm, gusage);
-   st.g2 = tex_ex(w, h, MTLPixelFormatRGBA8Unorm, msaa, gsm, gusage);
-   st.g3 = tex_ex(w, h, MTLPixelFormatR32Float, msaa, gsm, gusage);
+   bool gtrack = !tile;
+   st.g0 = tex_ex_opt(w, h, MTLPixelFormatRGBA8Unorm, msaa, gsm, gusage, gtrack);
+   st.g1 = tex_ex_opt(w, h, MTLPixelFormatRGBA16Float, msaa, gsm, gusage, gtrack);
+   st.g2 = tex_ex_opt(w, h, MTLPixelFormatRGBA8Unorm, msaa, gsm, gusage, gtrack);
+   st.g3 = tex_ex_opt(w, h, MTLPixelFormatR32Float, msaa, gsm, gusage, gtrack);
    st.depthTex = tex_ex(w, h, MTLPixelFormatDepth32Float, msaa, MTLStorageModeMemoryless, MTLTextureUsageRenderTarget);
    st.finalTex = tex_ex(w, h, MTLPixelFormatRGBA8Unorm, 1, MTLStorageModePrivate,
                         MTLTextureUsageRenderTarget | MTLTextureUsageShaderRead);
@@ -2126,8 +2145,10 @@ deferred_make_state(uint32_t w, uint32_t h, uint32_t msaa, bool tile)
    gd.colorAttachments[1].pixelFormat = MTLPixelFormatRGBA16Float;
    gd.colorAttachments[2].pixelFormat = MTLPixelFormatRGBA8Unorm;
    gd.colorAttachments[3].pixelFormat = MTLPixelFormatR32Float;
-   if (tile)
+   if (tile) {
       gd.colorAttachments[4].pixelFormat = MTLPixelFormatRGBA8Unorm;
+      gd.colorAttachments[4].writeMask = MTLColorWriteMaskNone;
+   }
    gd.depthAttachmentPixelFormat = MTLPixelFormatDepth32Float;
    st.pGeom = [g_dev newRenderPipelineStateWithDescriptor:gd error:&err];
    if (!st.pGeom)
@@ -2142,6 +2163,8 @@ deferred_make_state(uint32_t w, uint32_t h, uint32_t msaa, bool tile)
       ld.colorAttachments[1].pixelFormat = MTLPixelFormatRGBA16Float;
       ld.colorAttachments[2].pixelFormat = MTLPixelFormatRGBA8Unorm;
       ld.colorAttachments[3].pixelFormat = MTLPixelFormatR32Float;
+      for (int i = 0; i < 4; i++)
+         ld.colorAttachments[i].writeMask = MTLColorWriteMaskNone;
       ld.colorAttachments[4].pixelFormat = MTLPixelFormatRGBA8Unorm;
       ld.depthAttachmentPixelFormat = MTLPixelFormatDepth32Float;
    } else {
@@ -2476,6 +2499,7 @@ mdi_encode(id state, id<MTLCommandBuffer> cb, uint64_t k)
    uint32_t bcnt = st.bindless;
    [e setVertexBytes:&bcnt length:4 atIndex:1];
    [e setFragmentBuffer:st.argBuf offset:0 atIndex:0];
+   [e useResource:st.ib usage:MTLResourceUsageRead stages:MTLRenderStageVertex];
    [e useResources:st.resPtrs count:st.bindless usage:MTLResourceUsageRead stages:MTLRenderStageFragment];
    [e executeCommandsInBuffer:st.icb withRange:NSMakeRange(0, st.draws)];
    [e endEncoding];
@@ -2561,26 +2585,36 @@ run_compile_pso(const struct gb_opts *o)
             if (!is_gfx) {
                id<MTLFunction> fn = [g_lib newFunctionWithName:(is_uber ? @"pso_uber_main" : @"pso_comp_main")
                                                 constantValues:fc error:&err];
+               if (!fn)
+                  gb_die("compile.pso compute function failed: %s", err.localizedDescription.UTF8String);
                MTLComputePipelineDescriptor *cd = [MTLComputePipelineDescriptor new];
                cd.computeFunction = fn;
                if (phase == 0) {
-                  [ar addComputePipelineFunctionsWithDescriptor:cd error:&err];
+                  if (![ar addComputePipelineFunctionsWithDescriptor:cd error:&err])
+                     gb_die("compile.pso addComputePipeline failed: %s", err.localizedDescription.UTF8String);
                } else {
                   cd.binaryArchives = @[ar];
-                  last_cp = [g_dev newComputePipelineStateWithDescriptor:cd options:0 reflection:nil error:&err];
+                  last_cp = [g_dev newComputePipelineStateWithDescriptor:cd options:MTLPipelineOptionNone reflection:nil error:&err];
+                  if (!last_cp)
+                     gb_die("compile.pso warm compute pipeline failed: %s", err.localizedDescription.UTF8String);
                }
             } else {
                id<MTLFunction> vf = [g_lib newFunctionWithName:@"pso_gfx_vert" constantValues:fc error:&err];
                id<MTLFunction> ff = [g_lib newFunctionWithName:@"pso_gfx_frag" constantValues:fc error:&err];
+               if (!vf || !ff)
+                  gb_die("compile.pso graphics function failed: %s", err.localizedDescription.UTF8String);
                MTLRenderPipelineDescriptor *rd = [MTLRenderPipelineDescriptor new];
                rd.vertexFunction = vf;
                rd.fragmentFunction = ff;
                rd.colorAttachments[0].pixelFormat = MTLPixelFormatRGBA8Unorm;
                if (phase == 0) {
-                  [ar addRenderPipelineFunctionsWithDescriptor:rd error:&err];
+                  if (![ar addRenderPipelineFunctionsWithDescriptor:rd error:&err])
+                     gb_die("compile.pso addRenderPipeline failed: %s", err.localizedDescription.UTF8String);
                } else {
                   rd.binaryArchives = @[ar];
                   last_rp = [g_dev newRenderPipelineStateWithDescriptor:rd error:&err];
+                  if (!last_rp)
+                     gb_die("compile.pso warm render pipeline failed: %s", err.localizedDescription.UTF8String);
                }
             }
             uint64_t t1 = gb_now_ns();
@@ -2690,19 +2724,19 @@ cmp_setup(const struct gb_opts *o, char *err, size_t n)
    MTLTextureUsage rt_read = MTLTextureUsageRenderTarget | MTLTextureUsageShaderRead;
 
    if (k == MCMP_MRT4) {
-      st.g0 = tex_ex(st.w, st.h, mrt4[0], 1, MTLStorageModePrivate, rt_read);
-      st.g1 = tex_ex(st.w, st.h, mrt4[1], 1, MTLStorageModePrivate, rt_read);
-      st.g2 = tex_ex(st.w, st.h, mrt4[2], 1, MTLStorageModePrivate, rt_read);
-      st.g3 = tex_ex(st.w, st.h, mrt4[3], 1, MTLStorageModePrivate, rt_read);
+      st.g0 = tex_ex_opt(st.w, st.h, mrt4[0], 1, MTLStorageModePrivate, rt_read, true);
+      st.g1 = tex_ex_opt(st.w, st.h, mrt4[1], 1, MTLStorageModePrivate, rt_read, true);
+      st.g2 = tex_ex_opt(st.w, st.h, mrt4[2], 1, MTLStorageModePrivate, rt_read, true);
+      st.g3 = tex_ex_opt(st.w, st.h, mrt4[3], 1, MTLStorageModePrivate, rt_read, true);
       st.rpWrite = cmp_rpipe("compress_mrt4_frag", 4, mrt4, 1);
       st.rpRead = cmp_rpipe("compress_sample4_frag", 1, &rgba8, 1);
    } else if (k == MCMP_RGBA32F) {
-      st.g0 = tex_ex(st.w, st.h, rgba32f, 1, MTLStorageModePrivate, rt_read);
+      st.g0 = tex_ex_opt(st.w, st.h, rgba32f, 1, MTLStorageModePrivate, rt_read, true);
       st.rpWrite = cmp_rpipe("compress_write1_frag", 1, &rgba32f, 1);
       st.rpRead = cmp_rpipe("compress_sample1_frag", 1, &rgba8, 1);
    } else if (k == MCMP_MSAA4) {
       st.msaaTex = tex_ex(st.w, st.h, rgba8, 4, MTLStorageModeMemoryless, MTLTextureUsageRenderTarget);
-      st.g0 = tex_ex(st.w, st.h, rgba8, 1, MTLStorageModePrivate, rt_read);
+      st.g0 = tex_ex_opt(st.w, st.h, rgba8, 1, MTLStorageModePrivate, rt_read, true);
       st.rpWrite = cmp_rpipe("compress_write1_frag", 1, &rgba8, 4);
       st.rpRead = cmp_rpipe("compress_sample1_frag", 1, &rgba8, 1);
    } else if (k == MCMP_ARRAY) {
@@ -2711,12 +2745,14 @@ cmp_setup(const struct gb_opts *o, char *err, size_t n)
       ad.arrayLength = 6;
       ad.storageMode = MTLStorageModePrivate;
       ad.usage = rt_read;
-      ad.hazardTrackingMode = MTLHazardTrackingModeUntracked;
+      ad.hazardTrackingMode = MTLHazardTrackingModeTracked;
       st.arrTex = [g_dev newTextureWithDescriptor:ad];
+      if (!st.arrTex) gb_die("compress array texture failed");
       st.rpWrite = cmp_rpipe("compress_write1_frag", 1, &rgba8, 1);
       st.rpRead = cmp_rpipe("compress_array_frag", 1, &rgba8, 1);
    } else {
-      st.g0 = tex_ex(st.w, st.h, rgba8, 1, MTLStorageModePrivate, MTLTextureUsageShaderWrite | MTLTextureUsageShaderRead);
+      st.g0 = tex_ex_opt(st.w, st.h, rgba8, 1, MTLStorageModePrivate,
+                         MTLTextureUsageShaderWrite | MTLTextureUsageShaderRead, true);
       st.cpWrite = cpipe("compress_store_main");
       st.rpRead = cmp_rpipe("compress_sample1_frag", 1, &rgba8, 1);
    }
@@ -2897,7 +2933,9 @@ run_overlap_passes(const struct gb_opts *o)
    id<MTLBuffer> ba = buf(cbytes, false), bb = buf(cbytes, false);
    id<MTLTexture> ia = tex(1920, 1080, MTLTextureUsageRenderTarget);
    id<MTLTexture> ib = tex(1920, 1080, MTLTextureUsageRenderTarget);
-   id<MTLFence> fence = [g_dev newFence];
+   NSMutableArray<id<MTLFence>> *fences = [NSMutableArray arrayWithCapacity:8];
+   for (int i = 0; i < 8; i++)
+      [fences addObject:[g_dev newFence]];
 
    struct gb_pass pa = {0}, pb = {0}, pnb = {0}, pbar = {0};
    if (k == 3) {
@@ -2913,9 +2951,10 @@ run_overlap_passes(const struct gb_opts *o)
       } done:nil];
       GBStream *sbar = [[GBStream alloc] initWithQueue:new_queue(depth) depth:depth
                                                 encode:^(id<MTLCommandBuffer> cb, uint64_t seq) {
+         id<MTLFence> f = fences[seq & 7];
          id<MTLComputeCommandEncoder> e = [cb computeCommandEncoder];
-         ov_enc_comp(cp, ba, e); [e updateFence:fence]; [e endEncoding];
-         ov_enc_render(rp, ib, cb, seq, fence, nil);
+         ov_enc_comp(cp, ba, e); [e updateFence:f]; [e endEncoding];
+         ov_enc_render(rp, ib, cb, seq, f, nil);
       } done:nil];
       stream_run(sa, false, gb_now_ns(), W, o->runs, R, &pa);
       stream_run(sb, false, gb_now_ns(), W, o->runs, R, &pb);
@@ -2972,16 +3011,18 @@ run_overlap_passes(const struct gb_opts *o)
          if (run_b) ov_enc_comp(cp, bb, e);
          [e endEncoding];
       } else if (k == 1) {
+         id<MTLFence> f = bar ? fences[seq & 7] : nil;
          if (run_a) {
             id<MTLComputeCommandEncoder> e = [cb computeCommandEncoder];
             ov_enc_comp(cp, ba, e);
-            if (bar) [e updateFence:fence];
+            if (f) [e updateFence:f];
             [e endEncoding];
          }
-         if (run_b) ov_enc_render(rp, ib, cb, seq, bar ? fence : nil, nil);
+         if (run_b) ov_enc_render(rp, ib, cb, seq, f, nil);
       } else {
-         if (run_a) ov_enc_render(rp, ia, cb, seq, nil, bar ? fence : nil);
-         if (run_b) ov_enc_render(rp, ib, cb, seq + 1, bar ? fence : nil, nil);
+         id<MTLFence> f = bar ? fences[seq & 7] : nil;
+         if (run_a) ov_enc_render(rp, ia, cb, seq, nil, f);
+         if (run_b) ov_enc_render(rp, ib, cb, seq + 1, f, nil);
       }
    } done:nil];
    phase = 0; stream_run(s, false, gb_now_ns(), W, o->runs, R, &pa);

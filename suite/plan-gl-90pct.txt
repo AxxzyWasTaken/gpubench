@@ -1,5 +1,5 @@
 # gpubench OpenGL (gpubench-gl) 90%-coverage parity plan.
-# Run paired native-GL (asahi) vs Zink (zink) comparisons on Linux.
+# Run paired native-GL (aurora) vs Zink (zink) comparisons on Linux.
 #
 # chunk      lane   test            arguments
 gl-compress  gl     compress.bw     --depths 1,4 --param kind=mrt4 --param res=1440p
