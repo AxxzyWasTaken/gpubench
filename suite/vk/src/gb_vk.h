@@ -5,6 +5,41 @@
 
 #include <vulkan/vulkan.h>
 
+/* Compatibility shims for distro Vulkan headers older than 1.3.279 (e.g. Ubuntu
+ * 24.04 libvulkan-dev 1.3.275), which predate VK_KHR_dynamic_rendering_local_read. */
+#ifndef VK_KHR_dynamic_rendering_local_read
+#define VK_KHR_dynamic_rendering_local_read 1
+#define VK_KHR_DYNAMIC_RENDERING_LOCAL_READ_SPEC_VERSION 1
+#define VK_KHR_DYNAMIC_RENDERING_LOCAL_READ_EXTENSION_NAME "VK_KHR_dynamic_rendering_local_read"
+#define VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_DYNAMIC_RENDERING_LOCAL_READ_FEATURES_KHR ((VkStructureType)1000232000)
+#define VK_STRUCTURE_TYPE_RENDERING_ATTACHMENT_LOCATION_INFO_KHR ((VkStructureType)1000232001)
+#define VK_STRUCTURE_TYPE_RENDERING_INPUT_ATTACHMENT_INDEX_INFO_KHR ((VkStructureType)1000232002)
+#define VK_IMAGE_LAYOUT_RENDERING_LOCAL_READ_KHR ((VkImageLayout)1000232000)
+typedef struct VkPhysicalDeviceDynamicRenderingLocalReadFeaturesKHR {
+   VkStructureType sType;
+   void *pNext;
+   VkBool32 dynamicRenderingLocalRead;
+} VkPhysicalDeviceDynamicRenderingLocalReadFeaturesKHR;
+typedef struct VkRenderingAttachmentLocationInfoKHR {
+   VkStructureType sType;
+   const void *pNext;
+   uint32_t colorAttachmentCount;
+   const uint32_t *pColorAttachmentLocations;
+} VkRenderingAttachmentLocationInfoKHR;
+typedef struct VkRenderingInputAttachmentIndexInfoKHR {
+   VkStructureType sType;
+   const void *pNext;
+   uint32_t colorAttachmentCount;
+   const uint32_t *pColorAttachmentInputIndices;
+   const uint32_t *pDepthInputAttachmentIndex;
+   const uint32_t *pStencilInputAttachmentIndex;
+} VkRenderingInputAttachmentIndexInfoKHR;
+typedef void (VKAPI_PTR *PFN_vkCmdSetRenderingAttachmentLocationsKHR)(
+   VkCommandBuffer commandBuffer, const VkRenderingAttachmentLocationInfoKHR *pLocationInfo);
+typedef void (VKAPI_PTR *PFN_vkCmdSetRenderingInputAttachmentIndicesKHR)(
+   VkCommandBuffer commandBuffer, const VkRenderingInputAttachmentIndexInfoKHR *pInputAttachmentIndexInfo);
+#endif
+
 #include "gb_common.h"
 
 #define GB_MAX_QUEUES 16
@@ -26,6 +61,14 @@ struct gb_vk {
    uint32_t mem_host; /* HOST_VISIBLE | HOST_COHERENT, device-local when available */
    uint32_t mem_dev;  /* DEVICE_LOCAL */
    VkCommandPool oneshot_pool;
+   /* Optional Vulkan 1.2/1.3/1.4 features queried and enabled when present. */
+   bool has_local_read;
+   bool has_draw_indirect_count;
+   bool has_descriptor_indexing;
+   bool has_float16;
+   uint32_t max_sampled_images;
+   PFN_vkCmdSetRenderingAttachmentLocationsKHR cmd_set_attachment_locations;
+   PFN_vkCmdSetRenderingInputAttachmentIndicesKHR cmd_set_input_attachment_indices;
 };
 
 #define GB_VK_CHECK(call)                                                        \
@@ -68,7 +111,13 @@ struct gb_img {
 };
 void gb_img_create(struct gb_vk *vk, uint32_t w, uint32_t h, VkFormat fmt, VkImageUsageFlags usage,
                    struct gb_img *im);
+void gb_img_create_ex(struct gb_vk *vk, uint32_t w, uint32_t h, VkFormat fmt, VkSampleCountFlagBits samples,
+                      VkImageUsageFlags usage, VkImageAspectFlags aspect, struct gb_img *im);
 void gb_img_destroy(struct gb_vk *vk, struct gb_img *im);
+/* Readback helpers (one-shot transfer to host buffer, waits on queue 0). */
+void gb_buf_readback(struct gb_vk *vk, const struct gb_buf *src, void *dst, size_t bytes);
+void gb_buf_upload(struct gb_vk *vk, const void *src, struct gb_buf *dst, size_t bytes);
+void gb_img_readback(struct gb_vk *vk, const struct gb_img *im, VkImageLayout cur_layout, void *dst, size_t bpp);
 /* Image barrier helper (sync2). */
 void gb_img_barrier(VkCommandBuffer cb, VkImage img, VkImageLayout from, VkImageLayout to,
                     VkPipelineStageFlags2 src_stage, VkAccessFlags2 src_access,
@@ -156,5 +205,8 @@ struct gb_stream_test {
    /* derived throughput metrics from per-window us_per_submit */
    void (*derive)(const struct gb_opts *o, struct gb_result *r, const struct gb_samples *us_per_submit);
    bool no_timed; /* never run the timed pass (the test has no GPU work to time) */
+   /* Optional: compare the output of the submissions just run with the
+    * test's reference. Called with the queue idle, once per result. */
+   void (*check)(struct gb_vk *vk, void *state, struct gb_check *chk);
 };
 int gb_run_stream_test(const struct gb_opts *o, const struct gb_stream_test *t);

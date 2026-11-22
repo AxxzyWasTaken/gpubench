@@ -10,3 +10,15 @@ extern const struct gb_test gb_tests[];
 /* Builds every suite pipeline and prints VK_KHR_pipeline_executable_properties
  * statistics as JSON lines (used for suite/FAIRNESS.md). */
 int gb_shader_stats(const struct gb_opts *o);
+
+/* Wave-1 90%-coverage Vulkan benchmarks (tests_wave1.c). */
+int gb_run_compute_uber(const struct gb_opts *o);
+int gb_run_compute_conv2d(const struct gb_opts *o);
+int gb_run_compute_stereo(const struct gb_opts *o);
+int gb_run_compute_edge(const struct gb_opts *o);
+int gb_run_render_deferred(const struct gb_opts *o);
+int gb_run_concurrent_sram(const struct gb_opts *o);
+int gb_run_render_mdi(const struct gb_opts *o);
+int gb_run_compile_pso(const struct gb_opts *o);
+int gb_run_compress_bw(const struct gb_opts *o);
+int gb_run_overlap_passes(const struct gb_opts *o);

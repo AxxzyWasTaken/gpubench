@@ -1,0 +1,41 @@
+// SPDX-License-Identifier: GPL-2.0-only
+#version 450
+// compute.edge Stage 1: 3x3 Sobel gradient on cooperative 18x18 shared tile.
+layout(local_size_x = 16, local_size_y = 16) in;
+layout(std430, set = 0, binding = 0) readonly buffer In { uint src[]; };
+layout(std430, set = 0, binding = 1) writeonly buffer Grad { uint grad[]; };
+layout(std430, set = 0, binding = 2) writeonly buffer Mag { uint mag[]; };
+layout(push_constant) uniform PC { int w; int h; } pc;
+
+shared int tile[18][18];
+
+void main()
+{
+   int lx = int(gl_LocalInvocationID.x);
+   int ly = int(gl_LocalInvocationID.y);
+   int bx = int(gl_WorkGroupID.x * 16u) - 1;
+   int by = int(gl_WorkGroupID.y * 16u) - 1;
+   uint lid = gl_LocalInvocationIndex;
+   for (uint i = lid; i < 324u; i += 256u) {
+      int tx = int(i % 18u);
+      int ty = int(i / 18u);
+      int sx = clamp(bx + tx, 0, pc.w - 1);
+      int sy = clamp(by + ty, 0, pc.h - 1);
+      tile[ty][tx] = int(src[sy * pc.w + sx]);
+   }
+   barrier();
+
+   int x = int(gl_GlobalInvocationID.x);
+   int y = int(gl_GlobalInvocationID.y);
+   if (x >= pc.w || y >= pc.h)
+      return;
+
+   int p00 = tile[ly + 0][lx + 0], p01 = tile[ly + 0][lx + 1], p02 = tile[ly + 0][lx + 2];
+   int p10 = tile[ly + 1][lx + 0],                              p12 = tile[ly + 1][lx + 2];
+   int p20 = tile[ly + 2][lx + 0], p21 = tile[ly + 2][lx + 1], p22 = tile[ly + 2][lx + 2];
+   int gx = -p00 + p02 - 2 * p10 + 2 * p12 - p20 + p22;
+   int gy = -p00 - 2 * p01 - p02 + p20 + 2 * p21 + p22;
+   int idx = y * pc.w + x;
+   grad[idx] = (uint(gx + 2048) & 0xfffu) | ((uint(gy + 2048) & 0xfffu) << 12u);
+   mag[idx] = uint(abs(gx) + abs(gy));
+}

@@ -1,0 +1,51 @@
+# gpubench 90%-coverage Wave-1 plan (Vulkan + Metal parity).
+# Run via: tools/run-linux.sh --device neo --plans "suite/plan-90pct.txt"
+# Kept separate from suite/plan.txt so the existing 209-row performance-gate.py
+# reference remains untouched.
+#
+# chunk      lane   test             arguments
+
+# Dynamic Caching, divergent uber-shader, load/ALU ILP & unified SRAM contention.
+dyncache     suite  compute.uber     --depths 1,4 --param kind=divergent
+dyncache     suite  compute.uber     --depths 1,4 --param kind=uniform
+dyncache     suite  compute.uber     --depths 1,4 --param kind=ilp
+dyncache     suite  concurrent.sram  --param res=720p --param msaa=4
+dyncache     suite  concurrent.sram  --param res=1080p --param msaa=4
+
+# Geekbench 6 Vulkan-vs-Metal representative compute kernels (CRC-verified).
+gb-comp      suite  compute.conv2d   --depths 1,4 --param kind=gaussian --param res=1080p
+gb-comp      suite  compute.conv2d   --depths 1,4 --param kind=bilateral --param res=1080p
+gb-comp      suite  compute.stereo   --depths 1,2 --param disp=32
+gb-comp      suite  compute.stereo   --depths 1,2 --param disp=64
+gb-comp      suite  compute.edge     --depths 1,4 --param kind=sobel --param res=1080p
+gb-comp      suite  compute.edge     --depths 1,4 --param kind=harris --param res=1080p
+
+# Modern TBDR deferred rendering (4-MRT local_read vs DRAM + MSAA) & bindless MDI.
+modern-gfx   suite  render.deferred  --depths 1,2 --param mode=tile --param res=1080p --param msaa=1
+modern-gfx   suite  render.deferred  --depths 1,2 --param mode=dram --param res=1080p --param msaa=1
+modern-gfx   suite  render.deferred  --depths 1,2 --param mode=tile --param res=1080p --param msaa=4
+modern-gfx   suite  render.deferred  --depths 1,2 --param mode=dram --param res=1080p --param msaa=4
+modern-gfx   suite  render.mdi       --depths 1,4 --param draws=1024 --param bindless=256
+modern-gfx   suite  render.mdi       --depths 1,4 --param draws=4096 --param bindless=1024
+modern-gfx   suite  render.mdi       --depths 1,4 --param draws=10000 --param bindless=1024
+
+# Pipeline compile latency (cold vs warm cache stutter).
+compile      suite  compile.pso      --param kind=compute --param count=32
+compile      suite  compile.pso      --param kind=graphics --param count=32
+compile      suite  compile.pso      --param kind=uber --param count=32
+
+# Compression bandwidth suite (1440p/4K MRT4, RGBA32F, 4x MSAA, 6-layer array, storage image).
+compress     suite  compress.bw      --depths 1,4 --param kind=mrt4 --param res=1440p
+compress     suite  compress.bw      --depths 1,4 --param kind=mrt4 --param res=2160p
+compress     suite  compress.bw      --depths 1,4 --param kind=rgba32f --param res=1440p
+compress     suite  compress.bw      --depths 1,4 --param kind=rgba32f --param res=2160p
+compress     suite  compress.bw      --depths 1,4 --param kind=msaa4 --param res=1440p
+compress     suite  compress.bw      --depths 1,4 --param kind=msaa4 --param res=2160p
+compress     suite  compress.bw      --depths 1,4 --param kind=array --param res=1440p
+compress     suite  compress.bw      --depths 1,4 --param kind=storage --param res=1440p
+
+# Pass-overlap / anti-serialization suite (independent passes: no-barrier vs barrier vs solo sum).
+overlap      suite  overlap.passes   --param kind=comp_comp
+overlap      suite  overlap.passes   --param kind=comp_render
+overlap      suite  overlap.passes   --param kind=render_render
+overlap      suite  overlap.passes   --param kind=async_cr

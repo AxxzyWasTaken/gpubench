@@ -1366,6 +1366,17 @@ const struct gb_test gb_tests[] = {
    {"concurrent.cr", run_concurrent},
    {"query", run_query},
    {"idle.wake", run_idle},
+   /* 90%-coverage Wave-1 benchmarks */
+   {"compute.uber", gb_run_compute_uber},
+   {"compute.conv2d", gb_run_compute_conv2d},
+   {"compute.stereo", gb_run_compute_stereo},
+   {"compute.edge", gb_run_compute_edge},
+   {"render.deferred", gb_run_render_deferred},
+   {"concurrent.sram", gb_run_concurrent_sram},
+   {"render.mdi", gb_run_render_mdi},
+   {"compile.pso", gb_run_compile_pso},
+   {"compress.bw", gb_run_compress_bw},
+   {"overlap.passes", gb_run_overlap_passes},
    {NULL, NULL},
 };
 

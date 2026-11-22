@@ -1,0 +1,48 @@
+// SPDX-License-Identifier: GPL-2.0-only
+#version 450
+// compute.stereo: Geekbench-equivalent 11x11 dense SAD stereo disparity search
+// over 450x375 (pitch 512) packed uint8 grayscale images and 0..disp disparities.
+layout(local_size_x = 16, local_size_y = 16) in;
+layout(std430, set = 0, binding = 0) readonly buffer Left { uint left_b[]; };
+layout(std430, set = 0, binding = 1) readonly buffer Right { uint right_b[]; };
+layout(std430, set = 0, binding = 2) writeonly buffer Out { uint out_b[]; };
+layout(push_constant) uniform PC { int w; int h; int pitch; int disp; } pc;
+
+int load_left(int x, int y)
+{
+   uint off = uint(y * pc.pitch + x);
+   return int((left_b[off >> 2u] >> ((off & 3u) * 8u)) & 255u);
+}
+
+int load_right(int x, int y)
+{
+   uint off = uint(y * pc.pitch + x);
+   return int((right_b[off >> 2u] >> ((off & 3u) * 8u)) & 255u);
+}
+
+void main()
+{
+   int x = int(gl_GlobalInvocationID.x);
+   int y = int(gl_GlobalInvocationID.y);
+   if (x >= pc.w || y >= pc.h)
+      return;
+
+   uint best_sad = 0x7fffffffu;
+   uint best_d = 0u;
+   for (int d = 0; d < pc.disp; d++) {
+      uint sad = 0u;
+      for (int dy = -5; dy <= 5; dy++) {
+         int sy = clamp(y + dy, 0, pc.h - 1);
+         for (int dx = -5; dx <= 5; dx++) {
+            int lx = clamp(x + dx, 0, pc.w - 1);
+            int rx = clamp(x + dx - d, 0, pc.w - 1);
+            sad += uint(abs(load_left(lx, sy) - load_right(rx, sy)));
+         }
+      }
+      if (sad < best_sad) {
+         best_sad = sad;
+         best_d = uint(d);
+      }
+   }
+   out_b[y * pc.pitch + x] = (best_d & 0xffu) | ((best_sad & 0xffffffu) << 8u);
+}

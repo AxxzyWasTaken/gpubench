@@ -563,6 +563,55 @@ gb_result_simple(const struct gb_opts *o, enum gb_mode mode, int depth, const ch
    gb_result_finish(&r, status, NULL, why);
 }
 
+/* ---------------- output checks ---------------- */
+
+uint32_t
+gb_crc32(const void *data, size_t bytes)
+{
+   const unsigned char *p = data;
+   uint32_t crc = 0xffffffffu;
+   for (size_t i = 0; i < bytes; i++) {
+      crc ^= p[i];
+      for (int b = 0; b < 8; b++)
+         crc = (crc >> 1) ^ (0xedb88320u & (0u - (crc & 1u)));
+   }
+   return ~crc;
+}
+
+void
+gb_check_words(struct gb_check *chk, const uint32_t *got, const uint32_t *want, uint32_t expected_crc, size_t count)
+{
+   chk->done = true;
+   chk->crc = gb_crc32(got, count * sizeof(uint32_t));
+   chk->expected = expected_crc;
+   chk->valid = true;
+   for (size_t i = 0; i < count; i++) {
+      if (got[i] != want[i]) {
+         gb_log("output mismatch at word %zu: got 0x%08x, want 0x%08x (crc 0x%08x vs 0x%08x)",
+                i, got[i], want[i], chk->crc, expected_crc);
+         chk->valid = false;
+         return;
+      }
+   }
+   if (chk->crc != expected_crc) {
+      gb_log("output CRC mismatch: got 0x%08x, want 0x%08x", chk->crc, expected_crc);
+      chk->valid = false;
+   }
+}
+
+void
+gb_result_check(struct gb_result *r, const struct gb_check *chk)
+{
+   char buf[16];
+   gb_json_obj_begin(&r->j, "check");
+   snprintf(buf, sizeof(buf), "%08x", chk->crc);
+   gb_json_str(&r->j, "crc", buf);
+   snprintf(buf, sizeof(buf), "%08x", chk->expected);
+   gb_json_str(&r->j, "expected", buf);
+   gb_json_bool(&r->j, "valid", chk->valid);
+   gb_json_obj_end(&r->j);
+}
+
 /* ---------------- barrier ---------------- */
 
 struct gb_barrier {

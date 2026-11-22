@@ -1,0 +1,64 @@
+// SPDX-License-Identifier: GPL-2.0-only
+#version 450
+// compute.conv2d Pass 1 (Horizontal 17-tap separable Gaussian / Bilateral)
+// Cooperative 32x16 shared-memory halo tile for 16x16 workgroup.
+layout(local_size_x = 16, local_size_y = 16) in;
+layout(constant_id = 0) const uint BILATERAL = 0u;
+layout(std430, set = 0, binding = 0) readonly buffer Src { uint src[]; };
+layout(std430, set = 0, binding = 1) writeonly buffer Dst { uint dst[]; };
+layout(push_constant) uniform PC { int w; int h; } pc;
+
+const uint W17[17] = uint[17](
+   16u, 86u, 342u, 1052u, 2554u, 4996u, 7914u, 10242u,
+   11132u,
+   10242u, 7914u, 4996u, 2554u, 1052u, 342u, 86u, 16u
+);
+
+shared uint tile[16][32];
+
+void main()
+{
+   int lx = int(gl_LocalInvocationID.x);
+   int ly = int(gl_LocalInvocationID.y);
+   int gx = int(gl_WorkGroupID.x * 16u);
+   int gy = int(gl_WorkGroupID.y * 16u) + ly;
+   int sy = clamp(gy, 0, pc.h - 1);
+
+   for (int dx = lx; dx < 32; dx += 16) {
+      int sx = clamp(gx + dx - 8, 0, pc.w - 1);
+      tile[ly][dx] = src[sy * pc.w + sx];
+   }
+   barrier();
+
+   int x = gx + lx;
+   if (x >= pc.w || gy >= pc.h)
+      return;
+
+   uint cpx = tile[ly][lx + 8];
+   uvec4 cc = (uvec4(cpx) >> uvec4(0u, 8u, 16u, 24u)) & 255u;
+   int cluma = int((cc.r + 2u * cc.g + cc.b) >> 2u);
+   uvec4 acc = uvec4(0u);
+   uint wsum = 0u;
+   for (int t = 0; t < 17; t++) {
+      uint p = tile[ly][lx + t];
+      uvec4 ch = (uvec4(p) >> uvec4(0u, 8u, 16u, 24u)) & 255u;
+      uint wt = W17[t];
+      if (BILATERAL != 0u) {
+         int nluma = int((ch.r + 2u * ch.g + ch.b) >> 2u);
+         int diff = abs(cluma - nluma);
+         uint rw = diff < 64 ? (256u - uint(diff) * 4u) : 1u;
+         wt = (wt >> 4u) * rw;
+      }
+      acc += ch * wt;
+      wsum += wt;
+   }
+   uvec4 res;
+   if (BILATERAL == 0u) {
+      res = (acc + uvec4(32768u)) >> uvec4(16u);
+   } else {
+      uvec4 halfw = uvec4(wsum >> 1u);
+      res = (acc + halfw) / uvec4(wsum);
+   }
+   res = (res & 255u) << uvec4(0u, 8u, 16u, 24u);
+   dst[gy * pc.w + x] = res.r | res.g | res.b | res.a;
+}

@@ -106,6 +106,21 @@ void gb_result_finish(struct gb_result *r, const char *status, const char *prima
 void gb_result_simple(const struct gb_opts *o, enum gb_mode mode, int depth, const char *const *extra,
                       const char *status, const char *why);
 
+/* ---- output checks ----
+ * A test whose output is deterministic compares it with a CPU reference and
+ * reports the outcome in the result's "check" object. */
+struct gb_check {
+   bool done, valid;
+   uint32_t crc, expected;
+};
+uint32_t gb_crc32(const void *data, size_t bytes);
+/* Compares `got` with `want` (count 32-bit words each) and logs the first
+ * difference. `expected_crc` is the CRC-32 of `want`. */
+void gb_check_words(struct gb_check *chk, const uint32_t *got, const uint32_t *want, uint32_t expected_crc,
+                    size_t count);
+/* Writes the "check" object; call after the metrics, before gb_result_finish. */
+void gb_result_check(struct gb_result *r, const struct gb_check *chk);
+
 /* ---- thread barrier (portable) ---- */
 struct gb_barrier;
 struct gb_barrier *gb_barrier_new(int n);

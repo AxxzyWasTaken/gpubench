@@ -1,0 +1,20 @@
+# gpubench OpenGL (gpubench-gl) 90%-coverage parity plan.
+# Run paired native-GL (aurora) vs Zink (zink) comparisons on Linux.
+#
+# chunk      lane   test            arguments
+gl-compress  gl     compress.bw     --depths 1,4 --param kind=mrt4 --param res=1440p
+gl-compress  gl     compress.bw     --depths 1,4 --param kind=rgba32f --param res=1440p
+gl-compress  gl     compress.bw     --depths 1,4 --param kind=msaa4 --param res=1440p
+gl-compress  gl     compress.bw     --depths 1,4 --param kind=storage --param res=1440p
+gl-draws     gl     render.draws    --depths 1,4 --param draws=1024 --param mode=direct
+gl-draws     gl     render.draws    --depths 1,4 --param draws=1024 --param mode=mdi
+gl-draws     gl     render.draws    --depths 1,4 --param draws=4096 --param mode=direct
+gl-draws     gl     render.draws    --depths 1,4 --param draws=4096 --param mode=mdi
+gl-compute   gl     compute.uber    --depths 1,4 --param kind=divergent
+gl-compute   gl     compute.uber    --depths 1,4 --param kind=uniform
+gl-compute   gl     compute.image   --depths 1,4 --param res=1080p
+gl-compile   gl     compile.pso     --param kind=compute --param count=32
+gl-compile   gl     compile.pso     --param kind=graphics --param count=32
+gl-compile   gl     compile.pso     --param kind=uber --param count=32
+gl-sync      gl     sync.finish     --param kind=fence
+gl-sync      gl     sync.finish     --param kind=finish

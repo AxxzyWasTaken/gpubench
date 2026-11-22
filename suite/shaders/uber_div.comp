@@ -1,0 +1,65 @@
+// SPDX-License-Identifier: GPL-2.0-only
+#version 450
+// compute.uber kind=divergent: 24 live uvec4 state registers (192 half-regs at peak)
+// entering a 4-way per-thread divergent branch where each branch consumes 6 live vectors
+// and runs a narrow 48-iteration inner loop (stresses AGX3 Dynamic Caching + divergent last-use).
+layout(local_size_x = 256) in;
+layout(std430, set = 0, binding = 0) writeonly buffer Out { uint o[]; };
+layout(push_constant) uniform PC { uint seed; uint iters; } pc;
+
+#define U_B(X, p, a, b, c, d) X(a, p) X(b, a) X(c, b) X(d, c)
+#define U_ALL(X) \
+   U_B(X, a23, a0, a1, a2, a3) \
+   U_B(X, a3,  a4, a5, a6, a7) \
+   U_B(X, a7,  a8, a9, a10, a11) \
+   U_B(X, a11, a12, a13, a14, a15) \
+   U_B(X, a15, a16, a17, a18, a19) \
+   U_B(X, a19, a20, a21, a22, a23)
+
+#define U_DECL(a, p) sd = sd * uvec4(747796405u) + uvec4(2891336453u); uvec4 a = (sd ^ (sd >> uvec4(15u))) + ks;
+#define U_STEP(a, p) a += p ^ (a >> uvec4(9u));
+#define U_FOLD(a) sd = (sd ^ (a >> uvec4(sd.x & 15u))) * uvec4(16777619u);
+
+#define U_NARROW(ALT) { \
+   U_DECL(b0, b3) U_DECL(b1, b0) U_DECL(b2, b1) U_DECL(b3, b2) \
+   for (uint i = 0u; i < pc.iters; i++) { \
+      if (ALT) { \
+         b0 += b3 ^ (b0 << uvec4(7u)); b1 += b0 ^ (b1 << uvec4(7u)); \
+         b2 += b1 ^ (b2 << uvec4(7u)); b3 += b2 ^ (b3 << uvec4(7u)); \
+      } else { \
+         b0 += b3 ^ (b0 >> uvec4(9u)); b1 += b0 ^ (b1 >> uvec4(9u)); \
+         b2 += b1 ^ (b2 >> uvec4(9u)); b3 += b2 ^ (b3 >> uvec4(9u)); \
+      } \
+   } \
+   U_FOLD(b0) U_FOLD(b1) U_FOLD(b2) U_FOLD(b3) \
+}
+
+void main()
+{
+   uint id = gl_GlobalInvocationID.x;
+   uvec4 ks = uvec4(pc.seed);
+   uvec4 sd = ((uvec4(id) + uvec4(1u, 2u, 3u, 4u)) * uvec4(2654435761u)) ^ ks;
+   U_ALL(U_DECL)
+   for (uint s = 0u; s < 4u; s++) {
+      U_ALL(U_STEP)
+   }
+   uint sel = ((id ^ (id >> 2u)) ^ pc.seed) & 3u;
+   if (sel == 0u) {
+      U_FOLD(a0) U_FOLD(a1) U_FOLD(a2) U_FOLD(a3) U_FOLD(a4) U_FOLD(a5)
+      U_NARROW(false)
+      sd ^= uvec4(0x243f6a88u);
+   } else if (sel == 1u) {
+      U_FOLD(a6) U_FOLD(a7) U_FOLD(a8) U_FOLD(a9) U_FOLD(a10) U_FOLD(a11)
+      U_NARROW(true)
+      sd ^= uvec4(0x85a308d3u);
+   } else if (sel == 2u) {
+      U_FOLD(a12) U_FOLD(a13) U_FOLD(a14) U_FOLD(a15) U_FOLD(a16) U_FOLD(a17)
+      U_NARROW(false)
+      sd ^= uvec4(0x13198a2eu);
+   } else {
+      U_FOLD(a18) U_FOLD(a19) U_FOLD(a20) U_FOLD(a21) U_FOLD(a22) U_FOLD(a23)
+      U_NARROW(true)
+      sd ^= uvec4(0x03707344u);
+   }
+   o[id] = sd.x ^ sd.y ^ sd.z ^ sd.w;
+}
