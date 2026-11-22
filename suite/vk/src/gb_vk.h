@@ -66,9 +66,23 @@ struct gb_vk {
    bool has_draw_indirect_count;
    bool has_descriptor_indexing;
    bool has_float16;
+   bool has_buffer_device_address;
+   bool has_descriptor_buffer;
+   bool has_subgroup_ballot;
+   bool has_subgroup_arithmetic;
+   uint32_t subgroup_size;
    uint32_t max_sampled_images;
+   VkDeviceSize desc_buf_offset_align;
+   size_t ubo_desc_size;
    PFN_vkCmdSetRenderingAttachmentLocationsKHR cmd_set_attachment_locations;
    PFN_vkCmdSetRenderingInputAttachmentIndicesKHR cmd_set_input_attachment_indices;
+#ifdef VK_EXT_descriptor_buffer
+   PFN_vkGetDescriptorSetLayoutSizeEXT get_dsl_size;
+   PFN_vkGetDescriptorSetLayoutBindingOffsetEXT get_dsl_binding_offset;
+   PFN_vkGetDescriptorEXT get_descriptor;
+   PFN_vkCmdBindDescriptorBuffersEXT cmd_bind_desc_bufs;
+   PFN_vkCmdSetDescriptorBufferOffsetsEXT cmd_set_desc_buf_offsets;
+#endif
 };
 
 #define GB_VK_CHECK(call)                                                        \
@@ -97,9 +111,12 @@ struct gb_buf {
    VkDeviceMemory mem;
    VkDeviceSize size;
    void *map;
+   VkDeviceAddress addr;
 };
 void gb_buf_create(struct gb_vk *vk, VkDeviceSize size, VkBufferUsageFlags usage, bool host,
                    struct gb_buf *b);
+void gb_buf_create_addr(struct gb_vk *vk, VkDeviceSize size, VkBufferUsageFlags usage, bool host,
+                        struct gb_buf *b);
 void gb_buf_destroy(struct gb_vk *vk, struct gb_buf *b);
 
 struct gb_img {

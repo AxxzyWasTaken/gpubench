@@ -1,0 +1,12 @@
+# gpubench OpenGL (gpubench-gl) 90%-coverage Wave-2 parity plan.
+# Run paired native-GL (aurora) vs Zink (zink) comparisons on Linux.
+#
+# chunk      lane   test           arguments
+gl-shadow    gl     render.shadow  --depths 1,2 --param mode=depth_only --param fmt=d32f --param res=2048 --param inst=2048
+gl-shadow    gl     render.shadow  --depths 1,2 --param mode=alpha_test --param fmt=d32f --param res=2048 --param inst=2048
+gl-xfer      gl     transfer.ops   --depths 1,4 --param kind=clear_4m
+gl-xfer      gl     transfer.ops   --depths 1,4 --param kind=clear_16m
+gl-xfer      gl     transfer.ops   --depths 1,4 --param kind=copy_b2i
+gl-xfer      gl     transfer.ops   --depths 1,2 --param kind=mipchain
+gl-postfx    gl     render.postfx  --depths 1,2 --param res=1080p --param msaa=4
+gl-postfx    gl     render.postfx  --depths 1,2 --param res=1440p --param msaa=4

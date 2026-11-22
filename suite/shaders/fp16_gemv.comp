@@ -1,0 +1,47 @@
+// SPDX-License-Identifier: GPL-2.0-only
+#version 450
+#extension GL_EXT_shader_explicit_arithmetic_types_float16 : require
+
+layout(local_size_x = 64) in;
+
+layout(std430, set = 0, binding = 0) readonly buffer W { uint w_pk[]; };
+layout(std430, set = 0, binding = 1) readonly buffer X { uint x_pk[]; };
+layout(std430, set = 0, binding = 2) writeonly buffer Y { float y_out[]; };
+
+shared float s_sum[64];
+
+void main()
+{
+   uint lid = gl_LocalInvocationID.x;
+   uint r_local = lid >> 4;
+   uint lane = lid & 15u;
+   uint row = gl_WorkGroupID.x * 4u + r_local;
+   uint row_base = row * 1024u;
+
+   float acc = 0.0;
+   for (uint t = lane; t < 1024u; t += 16u) {
+      uint pk = w_pk[row_base + t];
+      f16vec4 wv = f16vec4(
+         float16_t(pk & 255u),
+         float16_t((pk >> 8) & 255u),
+         float16_t((pk >> 16) & 255u),
+         float16_t(pk >> 24)
+      );
+      vec2 x01 = unpackHalf2x16(x_pk[t * 2u]);
+      vec2 x23 = unpackHalf2x16(x_pk[t * 2u + 1u]);
+      f16vec4 xv = f16vec4(float16_t(x01.x), float16_t(x01.y), float16_t(x23.x), float16_t(x23.y));
+      f16vec4 p = wv * xv;
+      acc += float(p.x) + float(p.y) + float(p.z) + float(p.w);
+   }
+
+   s_sum[lid] = acc;
+   barrier();
+   if (lane < 8u) s_sum[lid] += s_sum[lid + 8u];
+   barrier();
+   if (lane < 4u) s_sum[lid] += s_sum[lid + 4u];
+   barrier();
+   if (lane < 2u) s_sum[lid] += s_sum[lid + 2u];
+   barrier();
+   if (lane == 0u)
+      y_out[row] = s_sum[lid] + s_sum[lid + 1u];
+}

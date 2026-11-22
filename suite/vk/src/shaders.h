@@ -41,6 +41,22 @@ GB_SHADER(compress_sample4_frag)
 GB_SHADER(compress_sample1_frag)
 GB_SHADER(compress_array_frag)
 GB_SHADER(compress_store_comp)
+/* Wave-2 shaders */
+GB_SHADER(shadow_depth_vert)
+GB_SHADER(shadow_alpha_frag)
+GB_SHADER(shadow_pcf_frag)
+GB_SHADER(cull_mdi_comp)
+GB_SHADER(cull_mdi_vert)
+GB_SHADER(cull_mdi_frag)
+GB_SHADER(bubo_vert)
+GB_SHADER(bubo_frag)
+GB_SHADER(fp16_gemv_comp)
+GB_SHADER(fp16_alumix_comp)
+GB_SHADER(postfx_scene_vert)
+GB_SHADER(postfx_scene_frag)
+GB_SHADER(postfx_down_frag)
+GB_SHADER(postfx_up_frag)
+GB_SHADER(postfx_tonemap_frag)
 #undef GB_SHADER
 
 #define GB_SPV(n) n, n##_size

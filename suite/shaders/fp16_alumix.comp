@@ -1,0 +1,81 @@
+// SPDX-License-Identifier: GPL-2.0-only
+#version 450
+#extension GL_EXT_shader_explicit_arithmetic_types_float16 : require
+
+layout(local_size_x = 256) in;
+
+layout(std430, set = 0, binding = 0) writeonly buffer O { float out_v[]; };
+layout(push_constant) uniform PC {
+   uint iters;
+   float a;
+   float b;
+} pc;
+
+void main()
+{
+   uint id = gl_GlobalInvocationID.x;
+   float16_t ha = float16_t(pc.a);
+   float16_t hb = float16_t(pc.b);
+   float fa = pc.a;
+   float fb = pc.b;
+
+   f16vec4 base0 = f16vec4(
+      float16_t((id + 0u) & 7u), float16_t((id + 1u) & 7u),
+      float16_t((id + 2u) & 7u), float16_t((id + 3u) & 7u)
+   ) * hb;
+   f16vec4 base1 = f16vec4(
+      float16_t((id + 2u) & 7u), float16_t((id + 3u) & 7u),
+      float16_t((id + 4u) & 7u), float16_t((id + 5u) & 7u)
+   ) * hb;
+
+   f16vec4 h0 = base0;
+   f16vec4 h1 = base1;
+   f16vec4 h2 = -base0;
+   f16vec4 h3 = -base1;
+   vec4 f0 = vec4(base0) + vec4(fb);
+   vec4 f1 = vec4(base1) - vec4(fb);
+
+   float16_t hsgn = ((id & 1u) != 0u) ? hb : -hb;
+   float fsgn = ((id & 1u) != 0u) ? fb : -fb;
+
+   f16vec4 c0 = base0;
+   f16vec4 c1 = f16vec4(
+      float16_t((id + 3u) & 7u), float16_t((id + 4u) & 7u),
+      float16_t((id + 5u) & 7u), float16_t((id + 6u) & 7u)
+   ) * hb;
+   f16vec4 c2 = f16vec4(
+      float16_t((id + 6u) & 7u), float16_t((id + 7u) & 7u),
+      float16_t((id + 8u) & 7u), float16_t((id + 9u) & 7u)
+   ) * hb;
+   f16vec4 c3 = f16vec4(
+      float16_t((id + 9u) & 7u), float16_t((id + 10u) & 7u),
+      float16_t((id + 11u) & 7u), float16_t((id + 12u) & 7u)
+   ) * hb;
+
+   f16vec4 d0 = c0 + f16vec4(hsgn);
+   f16vec4 d1 = c1 - f16vec4(hsgn);
+   f16vec4 d2 = c2 + f16vec4(hsgn);
+   f16vec4 d3 = c3 - f16vec4(hsgn);
+
+   vec4 cf0 = vec4(c0), cf1 = vec4(c1);
+   vec4 df0 = cf0 + vec4(fsgn), df1 = cf1 - vec4(fsgn);
+
+   for (uint i = 0u; i < pc.iters; i++) {
+      h0 = fma(h0, f16vec4(ha), c0);
+      h1 = fma(h1, f16vec4(ha), c1);
+      h2 = fma(h2, f16vec4(ha), c2);
+      h3 = fma(h3, f16vec4(ha), c3);
+      h0 = fma(h0, f16vec4(ha), d0);
+      h1 = fma(h1, f16vec4(ha), d1);
+      h2 = fma(h2, f16vec4(ha), d2);
+      h3 = fma(h3, f16vec4(ha), d3);
+
+      f0 = fma(f0, vec4(fa), cf0);
+      f1 = fma(f1, vec4(fa), cf1);
+      f0 = fma(f0, vec4(fa), df0);
+      f1 = fma(f1, vec4(fa), df1);
+   }
+
+   vec4 tot = vec4(h0) + vec4(h1) + vec4(h2) + vec4(h3) + f0 + f1;
+   out_v[id] = tot.x + tot.y + tot.z + tot.w;
+}

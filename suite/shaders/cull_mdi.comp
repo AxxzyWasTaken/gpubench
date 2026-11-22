@@ -1,0 +1,51 @@
+// SPDX-License-Identifier: GPL-2.0-only
+#version 460
+#extension GL_KHR_shader_subgroup_ballot : require
+
+layout(local_size_x = 64) in;
+
+struct Obj {
+   float cx, cy, r;
+   uint color;
+};
+
+struct DrawCmd {
+   uint indexCount;
+   uint instanceCount;
+   uint firstIndex;
+   int vertexOffset;
+   uint firstInstance;
+};
+
+layout(std430, set = 0, binding = 0) readonly buffer Objs { Obj objs[]; };
+layout(std430, set = 0, binding = 1) writeonly buffer Cmds { DrawCmd cmds[]; };
+layout(std430, set = 0, binding = 2) buffer Cnt { uint draw_count; };
+layout(push_constant) uniform PC { uint n_objs; } pc;
+
+void main()
+{
+   uint id = gl_GlobalInvocationID.x;
+   bool vis = false;
+   if (id < pc.n_objs) {
+      Obj o = objs[id];
+      vis = (o.cx + o.r >= -1.0) && (-o.cx + o.r >= -1.0) &&
+            (o.cy + o.r >= -1.0) && (-o.cy + o.r >= -1.0) &&
+            (o.cx * o.cx + o.cy * o.cy < 2.0);
+   }
+
+   uvec4 mask = subgroupBallot(vis);
+   uint cnt = subgroupBallotBitCount(mask);
+   uint off = subgroupBallotExclusiveBitCount(mask);
+   uint base = 0u;
+   if (subgroupElect() && cnt > 0u)
+      base = atomicAdd(draw_count, cnt);
+   base = subgroupBroadcastFirst(base);
+
+   if (vis) {
+      cmds[base + off].indexCount = 6u;
+      cmds[base + off].instanceCount = 1u;
+      cmds[base + off].firstIndex = 0u;
+      cmds[base + off].vertexOffset = 0;
+      cmds[base + off].firstInstance = id;
+   }
+}

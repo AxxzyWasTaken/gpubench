@@ -57,3 +57,35 @@
 #define GB_MDI_MAX_DRAWS 10000u
 
 #define GB_PSO_DEFAULT_COUNT 32u         /* compile.pso: default variant batch */
+
+/* ---- 90%-coverage Wave-2 heavy-game / AAA workload dimensions ---- */
+#define GB_SHADOW_CASCADES 4u            /* render.shadow: 4 CSM cascades */
+#define GB_SHADOW_RECV_DIM 1024u         /* render.shadow: 1024x1024 PCF receiver */
+#define GB_SHADOW_DEFAULT_INST 2048u     /* render.shadow: instances per cascade */
+
+#define GB_CULL_DIM 1024u                /* compute.cull_mdi: 1024x1024 target */
+#define GB_CULL_GRID 128u                /* 128x128 = 16384 disjoint 8x8 quads */
+#define GB_CULL_MAX_OBJS 16384u
+#define GB_CULL_LOCAL 64u
+
+#define GB_BUBO_DIM 1024u                /* render.bindless_ubo: 1024x1024 target */
+#define GB_BUBO_BANKS 16u                /* 16 UBO banks of vec4[1024] (256 KiB total) */
+#define GB_BUBO_ENTRIES 1024u
+#define GB_BUBO_MAX_DRAWS 2048u
+
+#define GB_FP16_GEMV_M 4096u             /* compute.fp16 mode=gemv: 4096x4096 u8->fp16 */
+#define GB_FP16_GEMV_K 4096u
+#define GB_FP16_GEMV_LOCAL 64u           /* 4 rows/workgroup x 16 lanes/row */
+#define GB_FP16_ALUMIX_GROUPS 256u       /* compute.fp16 mode=alu_mix: 65536 threads */
+#define GB_FP16_ALUMIX_LOCAL 256u
+#define GB_FP16_ALUMIX_ITERS 256u        /* 96 FLOPs/iter (64 FP16 + 32 FP32) */
+#define GB_FP16_ALUMIX_FLOP ((double)GB_FP16_ALUMIX_GROUPS * GB_FP16_ALUMIX_LOCAL * GB_FP16_ALUMIX_ITERS * 96.0)
+
+#define GB_XFER_4M_DIM 1024u             /* transfer.ops kind=clear_4m (4 MiB) */
+#define GB_XFER_16M_DIM 2048u            /* transfer.ops kind=clear_16m / copy_b2i (16 MiB) */
+#define GB_XFER_MIP_W 2560u              /* transfer.ops kind=mipchain (1440p -> 1x1) */
+#define GB_XFER_MIP_H 1440u
+#define GB_XFER_MIP_LEVELS 12u
+
+#define GB_POSTFX_QUADS 4096u            /* render.postfx: 64x64 HDR scene quads */
+#define GB_POSTFX_BLOOM_MIPS 5u          /* 5-level bloom pyramid (res/2 .. res/32) */
