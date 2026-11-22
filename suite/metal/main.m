@@ -2415,7 +2415,7 @@ mdi_setup(const struct gb_opts *o, char *err, size_t n)
    mtl_buf_upload(st.ib, idxs, sizeof(idxs));
 
    st.texs = [NSMutableArray arrayWithCapacity:st.bindless];
-   __unsafe_unretained id<MTLResource> *ptrs = calloc(st.bindless, sizeof(id<MTLResource>));
+   __unsafe_unretained id<MTLResource> *ptrs = (__unsafe_unretained id<MTLResource> *)calloc(st.bindless, sizeof(id<MTLResource>));
    size_t one_tex = GB_MDI_TEX_DIM * GB_MDI_TEX_DIM * sizeof(uint32_t);
    id<MTLBuffer> stg = buf(st.bindless * one_tex, true);
    id<MTLCommandQueue> q = [g_dev newCommandQueue];
@@ -3123,7 +3123,7 @@ shadow_setup(const struct gb_opts *o, char *err, size_t n)
    if (!st.depthTex) gb_die("shadow depth array failed");
 
    st.recvTex = tex_ex_opt(GB_SHADOW_RECV_DIM, GB_SHADOW_RECV_DIM, MTLPixelFormatRGBA8Unorm, 1,
-                           MTLTextureUsageRenderTarget | MTLTextureUsageShaderRead, false, true);
+                           MTLStorageModePrivate, MTLTextureUsageRenderTarget | MTLTextureUsageShaderRead, true);
 
    MTLSamplerDescriptor *sd = [MTLSamplerDescriptor new];
    sd.minFilter = MTLSamplerMinMagFilterLinear;
@@ -3287,7 +3287,7 @@ cull_mdi_setup(const struct gb_opts *o, char *err, size_t n)
    if (!st.pDraw) gb_die("cull_mdi render pipe failed: %s", merr.localizedDescription.UTF8String);
 
    st.fbTex = tex_ex_opt(GB_CULL_DIM, GB_CULL_DIM, MTLPixelFormatRGBA8Unorm, 1,
-                         MTLTextureUsageRenderTarget | MTLTextureUsageShaderRead, false, true);
+                         MTLStorageModePrivate, MTLTextureUsageRenderTarget | MTLTextureUsageShaderRead, true);
    return st;
 }
 
@@ -3777,21 +3777,21 @@ postfx_setup(const struct gb_opts *o, char *err, size_t n)
    GBPostfxState *st = [GBPostfxState new];
    st.w = w; st.h = h; st.msaa = (uint32_t)msaa;
    if (msaa == 4)
-      st.hdrMs = tex_ex_opt(w, h, MTLPixelFormatRGBA16Float, 4, MTLTextureUsageRenderTarget, true, false);
+      st.hdrMs = tex_ex_opt(w, h, MTLPixelFormatRGBA16Float, 4, MTLStorageModeMemoryless, MTLTextureUsageRenderTarget, false);
    st.hdrRes = tex_ex_opt(w, h, MTLPixelFormatRGBA16Float, 1,
-                          MTLTextureUsageRenderTarget | MTLTextureUsageShaderRead, false, true);
-   st.depthMs = tex_ex_opt(w, h, MTLPixelFormatDepth32Float, (uint32_t)msaa, MTLTextureUsageRenderTarget, true, false);
+                          MTLStorageModePrivate, MTLTextureUsageRenderTarget | MTLTextureUsageShaderRead, true);
+   st.depthMs = tex_ex_opt(w, h, MTLPixelFormatDepth32Float, (uint32_t)msaa, MTLStorageModeMemoryless, MTLTextureUsageRenderTarget, false);
    NSMutableArray<id<MTLTexture>> *bloom = [NSMutableArray arrayWithCapacity:GB_POSTFX_BLOOM_MIPS];
    uint32_t bw = w, bh = h;
    for (uint32_t i = 0; i < GB_POSTFX_BLOOM_MIPS; i++) {
       bw = bw > 1 ? bw / 2 : 1;
       bh = bh > 1 ? bh / 2 : 1;
       [bloom addObject:tex_ex_opt(bw, bh, MTLPixelFormatRGBA16Float, 1,
-                                  MTLTextureUsageRenderTarget | MTLTextureUsageShaderRead, false, true)];
+                                  MTLStorageModePrivate, MTLTextureUsageRenderTarget | MTLTextureUsageShaderRead, true)];
    }
    st.bloom = bloom;
    st.finalTex = tex_ex_opt(w, h, MTLPixelFormatRGBA8Unorm, 1,
-                            MTLTextureUsageRenderTarget | MTLTextureUsageShaderRead, false, true);
+                            MTLStorageModePrivate, MTLTextureUsageRenderTarget | MTLTextureUsageShaderRead, true);
 
    MTLSamplerDescriptor *sd = [MTLSamplerDescriptor new];
    sd.minFilter = MTLSamplerMinMagFilterLinear;

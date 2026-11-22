@@ -124,7 +124,7 @@ fragment float4 cull_mdi_frag(CullVOut in [[stage_in]])
 struct BuboPC { uint draw_id; };
 struct BuboVOut { float4 pos [[position]]; uint draw_id [[flat]]; };
 struct BuboBank { float4 lut[1024]; };
-struct BuboBanksArg { constant BuboBank *banks[16] [[id(0)]]; };
+struct BuboBanksArg { array<constant BuboBank *, 16> banks [[id(0)]]; };
 
 static constant float2 kBuboQuad[6] = {
    float2(0.0f, 0.0f), float2(16.0f, 0.0f), float2(16.0f, 32.0f),
