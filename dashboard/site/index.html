@@ -7,8 +7,8 @@
   <meta name="description" content="Measured Vulkan, OpenGL, and Metal performance on Apple silicon.">
   <title>GPU Benchmarks · Aurora Silicon</title>
   <link rel="icon" href="./favicon.svg" type="image/svg+xml">
-  <link rel="stylesheet" href="./style.css?v=3">
-  <script src="./app.js?v=3" type="module"></script>
+  <link rel="stylesheet" href="./style.css?v=4">
+  <script src="./app.js?v=4" type="module"></script>
 </head>
 <body>
   <header class="masthead">
@@ -36,14 +36,10 @@
       <div class="devices" id="devices" role="group" aria-label="Device"></div>
 
       <div class="overview" aria-label="Performance overview">
-        <figure class="panel overview-panel">
-          <figcaption>
-            <h2 id="spotlight-title">Selected Vulkan workloads</h2>
-            <p>Queue depth 4 · Metal = 1×</p>
-          </figcaption>
-          <div id="workload-overview" class="workload-overview" role="group" aria-labelledby="spotlight-title"></div>
-          <div id="workload-key" class="overview-key" aria-label="Chart series"></div>
-        </figure>
+        <nav class="panel group-index" aria-labelledby="groups-heading">
+          <h2 id="groups-heading">Benchmark groups</h2>
+          <ul id="group-links"></ul>
+        </nav>
 
         <figure class="panel overview-panel">
           <figcaption>
@@ -142,6 +138,12 @@
           </label>
         </div>
         <p id="comparison-status" class="comparison-status" aria-live="polite"></p>
+        <p id="comparison-empty" class="comparison-empty" hidden></p>
+      </section>
+
+      <div id="benchmark-groups"></div>
+
+      <template id="group-table">
         <table class="comparison-table">
           <colgroup>
             <col class="comparison-workload-col"><col class="comparison-stack-col">
@@ -155,23 +157,22 @@
               <th scope="col" class="comparison-median">Metal</th>
               <th scope="col" class="comparison-ratio-heading">
                 <span class="comparison-axis">
-                  <span>Metal leads <small id="axis-min"></small></span><span>1×</span><span>Linux leads <small id="axis-max"></small></span>
+                  <span>Metal leads <small class="axis-min"></small></span><span>1×</span><span>Linux leads <small class="axis-max"></small></span>
                 </span>
                 <span class="comparison-ratio-label">Ratio</span>
               </th>
             </tr>
           </thead>
-          <tbody id="comparison-rows"></tbody>
+          <tbody></tbody>
         </table>
-        <p id="comparison-empty" class="comparison-empty" hidden></p>
-      </section>
+      </template>
 
       <details id="methodology" class="methodology">
         <summary>How comparisons are calculated</summary>
         <p>Each comparison pairs one Linux API with Metal on the same chip, workload, parameters, mode, depth and primary metric. The table uses the newest run per API and configuration with a recorded, clean suite revision. Failed, skipped, ambiguous and incompatible results appear under Unmatched.</p>
         <p>Ratios above 1× favor Linux. For metrics such as latency, the ratio is Metal time divided by Linux time. Bars use a logarithmic scale centered at 1×. Reciprocal ratios such as 0.5× and 2× extend the same distance in opposite directions.</p>
         <p>Counts use the reported medians, and each depth counts separately. Look at the percentiles and sample counts in the workload inspector to judge how repeatable a lead may be. Driver builds, suite revisions, operating systems and run conditions vary.</p>
-        <p>The selected workload chart uses four fixed Vulkan cases in queue mode at depth 4: heavy compute ALU, bandwidth, 1080p fill and buffer-to-buffer copy. Each dot is one matched result.</p>
+        <p>Group charts show selected cases from the active filters. Every dot is one matched result. Each chart shares a Metal baseline of 1×, and its scale adjusts to the cases shown. Expand the measurements to see every result in that group.</p>
       </details>
     </section>
   </main>

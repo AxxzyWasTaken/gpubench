@@ -1,4 +1,5 @@
-import { buildComparisons, canCompare, compatible, relative, workloadKey } from "./comparison.js?v=3";
+import { buildComparisons, canCompare, compatible, relative, workloadKey } from "./comparison.js?v=4";
+import { BENCHMARK_GROUPS, benchmarkGroup, selectChartCases } from "./groups.js?v=4";
 
 const DEVICES = [
   { id: "neo", name: "A18 Pro", model: "MacBook Neo" },
@@ -11,13 +12,6 @@ const APIS = [
   { id: "gl-zink", name: "OpenGL / Zink", platform: "Linux" },
   { id: "metal", name: "Metal", platform: "macOS" },
 ];
-const SPOTLIGHT_CASES = [
-  ["Heavy compute", "compute.heavy", { kind: "alu" }],
-  ["Memory bandwidth", "compute.heavy", { kind: "bw" }],
-  ["1080p fill", "render.heavy", { kind: "fill", res: "1080p" }],
-  ["Buffer copy", "copy.bw", { kind: "buf2buf" }],
-];
-const SPOTLIGHT_DEPTH = 4;
 const TEST_NAMES = {
   "submit.empty": "Empty submission",
   "compute.light": "Light compute",
@@ -45,6 +39,10 @@ const METRIC_NAMES = {
   gpix_s: "Pixel throughput",
   mtri_s: "Triangle throughput",
   fps: "Frame rate",
+  mrays_s: "Ray throughput",
+  cycle_us: "Allocation cycle",
+  us_per_hop: "Signal hop time",
+  wake_latency_us: "Wake latency",
 };
 const LOCAL_FEED = "./data/benchmarks.json";
 const LIVE_FEED = "https://raw.githubusercontent.com/aurora-silicon/gpubench/gpu-dashboard/dashboard/site/data/benchmarks.json";
@@ -55,7 +53,7 @@ const byId = (id) => document.getElementById(id);
 const theme = matchMedia("(prefers-color-scheme: dark)");
 const state = {
   device: "neo", comparisonDevice: "all", runs: [], comparisons: [],
-  hidden: new Set(), pinned: new Map(), plot: null, returnTarget: null,
+  hidden: new Set(), pinned: new Map(), openGroups: new Set(), plot: null, returnTarget: null,
 };
 const comparisonSearch = byId("comparison-search");
 const comparisonApi = byId("comparison-api");
@@ -147,7 +145,6 @@ function renderDevices() {
       state.hidden.clear();
       state.pinned.clear();
       renderDevices();
-      renderOverview();
       renderComparison();
       renderWorkloads();
       writeQuery();
@@ -171,11 +168,12 @@ function makeComparisonRows(runs) {
     const api = APIS.find((item) => item.id === pair.api);
     if (!device || !api) return null;
     const params = Object.entries(row.params).map(([key, value]) => `${key}=${value}`);
+    const group = BENCHMARK_GROUPS.find(({ id }) => id === benchmarkGroup(row));
     const configuration = [`Depth ${row.depth}`, row.mode !== "queue" && row.mode, ...params].filter(Boolean).join(" · ");
     const title = TEST_NAMES[row.test] ?? row.test;
-    const searchable = [row.test, workloadName(row), device.name, device.model, api.name, groupName(row), configuration]
+    const searchable = [row.test, workloadName(row), device.name, device.model, api.name, groupName(row), group.title, configuration]
       .join(" ").toLowerCase();
-    return { ...pair, row, device, api, title, configuration, searchable, outcome: compareDelta(pair.ratio) };
+    return { ...pair, row, device, api, group: group.id, title, configuration, searchable, outcome: compareDelta(pair.ratio) };
   }).filter(Boolean);
 }
 
@@ -188,50 +186,148 @@ function axisRange(entries, minimum = 1) {
     entry.ratio == null ? max : Math.max(max, Math.abs(Math.log2(entry.ratio))), minimum));
 }
 
-function renderSpotlight() {
-  const devices = DEVICES.filter((device) => state.comparisonDevice === "all" || device.id === state.comparisonDevice);
-  const cases = SPOTLIGHT_CASES.map(([title, test, params]) => {
-    const key = workloadKey({ lane: "suite", test, params, mode: "queue" });
-    const entries = state.comparisons.filter(({ api, row, ratio }) =>
-      api.id === "vulkan" && row.depth === SPOTLIGHT_DEPTH && ratio != null && workloadKey(row) === key);
-    return { title, entries };
-  });
-  const extent = axisRange(cases.flatMap(({ entries }) => entries), 2);
+function buildGroupChart(group, cases) {
+  const selected = cases.flatMap(({ entries }) => entries);
+  const devices = DEVICES.filter((device) => selected.some((entry) => entry.device.id === device.id));
+  const extent = axisRange(selected);
+  const figure = node("figure", null, "group-chart");
+  figure.setAttribute("aria-label", `${group.title} ratios to Metal`);
+  const chart = node("div", null, "workload-overview");
   const axis = node("div", null, "workload-axis");
   for (const position of [-1, -0.5, 0, 0.5, 1]) {
     axis.append(node("span", `${axisNumber.format(2 ** (extent * position))}×`));
   }
-
-  const chart = byId("workload-overview");
-  chart.replaceChildren(axis);
-  for (const { title, entries } of cases) {
+  chart.append(axis);
+  for (const { title, row, api, entries, curated } of cases) {
     const track = node("div", null, "workload-chart-track");
+    const label = node("div", title, "workload-chart-name");
+    const configuration = entries[0].configuration;
+    const detail = curated ? `Depth ${row.depth}` : configuration;
+    label.append(node("small", [detail, api.name, metricName(row.primary)].join(" · ")));
     for (const device of devices) {
       const entry = entries.find((item) => item.device.id === device.id);
       const lane = node("div", null, "workload-chart-lane");
       if (entry) {
         const position = 50 + Math.log2(entry.ratio) * 50 / extent;
-        const label = `${ratioText(entry.ratio)}×`;
+        const ratio = `${ratioText(entry.ratio)}×`;
         const button = node("button", null, `workload-point chart-${device.id}`);
         button.type = "button";
         button.style.setProperty("--point", `${position}%`);
-        if (position >= 81) button.dataset.labelLeft = "";
-        button.title = `${title} · ${device.name} · ${label} Metal`;
+        if (position >= 79) button.dataset.labelLeft = "";
+        button.title = `${title} · ${configuration} · ${device.name} · ${ratio} Metal`;
         button.setAttribute("aria-label", button.title);
-        button.append(node("span", label));
+        button.append(node("span", ratio));
         button.addEventListener("click", () => inspectComparison(entry, button));
         lane.append(button);
       }
       track.append(lane);
     }
-    if (!track.querySelector("button")) track.replaceChildren(node("span", "No matched result", "workload-chart-missing"));
-    chart.append(node("span", title, "workload-chart-name"), track);
+    chart.append(label, track);
   }
-  byId("workload-key").replaceChildren(...devices.map((device) => {
+  const legend = node("div", null, "overview-key");
+  legend.setAttribute("aria-label", "Chart series");
+  for (const device of devices) {
     const key = node("span", null, `chip-key chart-${device.id}`);
     key.append(node("i"), document.createTextNode(device.name));
-    return key;
-  }));
+    legend.append(key);
+  }
+  figure.append(chart, legend);
+  return figure;
+}
+
+function buildCoverageChart(entries) {
+  const figure = node("figure", null, "group-chart");
+  figure.setAttribute("aria-label", "Measurement coverage");
+  const coverage = { linux: 0, metal: 0, both: 0, neither: 0 };
+  for (const { linuxMetric, metalMetric } of entries) {
+    if (linuxMetric && metalMetric) coverage.both++;
+    else if (linuxMetric) coverage.linux++;
+    else if (metalMetric) coverage.metal++;
+    else coverage.neither++;
+  }
+  const chart = node("div", null, "coverage-chart");
+  for (const [name, count] of [
+    ["Linux only", coverage.linux], ["Metal only", coverage.metal],
+    ["Both medians", coverage.both], ["No usable median", coverage.neither],
+  ]) {
+    const row = node("div");
+    const label = node("div", null, "win-label");
+    label.append(node("strong", name), node("span", `${count}/${entries.length}`, "technical"));
+    const bar = node("div", null, "win-bar");
+    const segment = node("span");
+    segment.style.flexBasis = `${count * 100 / entries.length}%`;
+    bar.setAttribute("aria-hidden", "true");
+    bar.append(segment);
+    row.append(label, bar);
+    chart.append(row);
+  }
+  figure.append(chart);
+  return figure;
+}
+
+function buildGroupSection(group, entries, scope) {
+  const section = node("section", null, "panel benchmark-group");
+  section.id = `group-${group.id}`;
+  section.setAttribute("aria-labelledby", `${section.id}-title`);
+
+  const heading = node("div", null, "group-heading");
+  const title = node("div");
+  const headingText = node("h2", group.title);
+  headingText.id = `${section.id}-title`;
+  const chartCases = selectChartCases(group, entries);
+  title.append(headingText, node("p", chartCases.length
+    ? "Selected cases · Metal = 1×" : "Measurement coverage · No matched results in view"));
+  heading.append(title);
+
+  const matched = scope.filter((entry) => entry.ratio != null);
+  if (matched.length) {
+    const wins = matched.filter((entry) => entry.outcome === "linux").length;
+    const score = node("div", null, "group-score");
+    score.append(node("strong", percent.format(wins / matched.length)),
+      node("small", `Linux faster in ${wins}/${matched.length}`));
+    heading.append(score);
+  }
+  section.append(heading, chartCases.length ? buildGroupChart(group, chartCases) : buildCoverageChart(entries));
+
+  const details = node("details", null, "group-measurements");
+  details.open = state.openGroups.has(group.id);
+  const summary = node("summary", "Measurements");
+  summary.append(node("span", `${number.format(entries.length)} results`, "technical"));
+  const table = byId("group-table").content.firstElementChild.cloneNode(true);
+  table.setAttribute("aria-label", `${group.title} measurements`);
+  const extent = axisRange(entries);
+  table.querySelector(".axis-min").textContent = `${axisNumber.format(2 ** -extent)}×`;
+  table.querySelector(".axis-max").textContent = `${axisNumber.format(2 ** extent)}×`;
+  table.querySelector("tbody").append(...entries.map((entry) => renderComparisonRow(entry, extent)));
+  details.addEventListener("toggle", () => {
+    if (!details.isConnected || details.open === state.openGroups.has(group.id)) return;
+    if (details.open) state.openGroups.add(group.id);
+    else state.openGroups.delete(group.id);
+    writeQuery();
+  });
+  details.append(summary, table);
+  section.append(details);
+  return section;
+}
+
+function renderGroups(visible, scope) {
+  const sections = [];
+  const links = [];
+  for (const group of BENCHMARK_GROUPS) {
+    const entries = visible.filter((entry) => entry.group === group.id);
+    if (!entries.length) continue;
+    sections.push(buildGroupSection(group, entries, scope.filter((entry) => entry.group === group.id)));
+    const item = node("li");
+    const link = node("a");
+    link.href = `#group-${group.id}`;
+    link.setAttribute("aria-label", `${group.title}, ${entries.length} results`);
+    link.append(node("span", group.title), node("small", number.format(entries.length)));
+    item.append(link);
+    links.push(item);
+  }
+  byId("benchmark-groups").replaceChildren(...sections);
+  byId("group-links").replaceChildren(...links);
+  return sections.length;
 }
 
 function renderWinShares() {
@@ -262,11 +358,6 @@ function renderWinShares() {
   const axis = node("div", null, "win-axis");
   axis.append(node("span", "0%"), node("span", "50%"), node("span", "100%"));
   byId("wins-overview").replaceChildren(...rows, axis);
-}
-
-function renderOverview() {
-  renderSpotlight();
-  renderWinShares();
 }
 
 function renderComparison() {
@@ -313,17 +404,14 @@ function renderComparison() {
       a.api.name.localeCompare(b.api.name);
   });
 
-  const extent = axisRange(visible);
-  byId("axis-min").textContent = `${axisNumber.format(2 ** -extent)}×`;
-  byId("axis-max").textContent = `${axisNumber.format(2 ** extent)}×`;
-  byId("comparison-rows").replaceChildren(...visible.map((entry) => renderComparisonRow(entry, extent)));
+  const groupCount = renderGroups(visible, filtered);
   const empty = byId("comparison-empty");
   empty.hidden = Boolean(visible.length);
   empty.textContent = result === "matched" && counts.unmatched
     ? "No Metal matches for these filters. Switch Results to Unmatched to see the available measurements."
     : "No results for these filters.";
   byId("comparison-status").textContent =
-    `${number.format(visible.length)} shown · ${number.format(matched)} matched · ${number.format(counts.unmatched)} unmatched`;
+    `${groupCount} groups · ${number.format(visible.length)} shown · ${number.format(matched)} matched · ${number.format(counts.unmatched)} unmatched`;
 }
 
 function renderComparisonRow(entry, extent) {
@@ -407,7 +495,7 @@ function renderWorkloads(previous = workloadSelect.value, requestedMetric = metr
 
   const groups = new Map();
   for (const [key, row] of unique) {
-    const group = groupName(row);
+    const group = BENCHMARK_GROUPS.find(({ id }) => id === benchmarkGroup(row)).title;
     if (!groups.has(group)) groups.set(group, []);
     groups.get(group).push([key, workloadName(row)]);
   }
@@ -764,6 +852,8 @@ function restoreQuery() {
     state.runs.some((run) => run.device === device.id)).id;
   state.returnTarget = null;
   returnToResult.hidden = true;
+  const openGroups = (params.get("tables") ?? "").split(",");
+  state.openGroups = new Set(BENCHMARK_GROUPS.filter(({ id }) => openGroups.includes(id)).map(({ id }) => id));
 
   comparisonSearch.value = params.get("q") ?? "";
   setFilter(comparisonApi, params.get("api"));
@@ -780,7 +870,6 @@ function restoreQuery() {
   }
 
   renderDevices();
-  renderOverview();
   renderComparison();
   renderWorkloads(params.get("workload") ?? "", params.get("metric") ?? "");
 }
@@ -794,6 +883,7 @@ function writeQuery(method = "pushState") {
     api: comparisonApi.value,
     results: comparisonResult.value === "matched" ? "" : comparisonResult.value,
     sort: comparisonSort.value === "linux" ? "" : comparisonSort.value,
+    tables: [...state.openGroups].join(","),
     "inspect-chip": inspector.open && state.device !== state.comparisonDevice ? state.device : "",
     workload: inspector.open ? workloadSelect.value : "",
     metric: inspector.open ? metricSelect.value : "",
@@ -816,9 +906,15 @@ function applyFeed(feed) {
   state.comparisons = makeComparisonRows(state.runs);
   const device = DEVICES.find((item) => state.runs.some((run) => run.device === item.id));
   if (!device) throw new Error("No supported devices in benchmark feed");
+  const firstLoad = byId("explorer").hidden;
   byId("explorer").hidden = false;
   byId("load-status").hidden = true;
+  renderWinShares();
   restoreQuery();
+  if (firstLoad && location.hash.startsWith("#group-")) {
+    const target = byId(location.hash.slice(1));
+    if (target) requestAnimationFrame(() => target.scrollIntoView());
+  }
 }
 
 async function start() {

@@ -1,6 +1,7 @@
 import assert from "node:assert/strict";
 import { test } from "node:test";
 import { buildComparisons, relative } from "./site/comparison.js";
+import { BENCHMARK_GROUPS, benchmarkGroup, selectChartCases } from "./site/groups.js";
 
 const rate = (median) => ({ median, unit: "fps", better: "higher" });
 const time = (median) => ({ median, unit: "us", better: "lower" });
@@ -63,4 +64,35 @@ test("bad results in the newest clean run stay unmatched", () => {
   assert.deepEqual(results.map(({ ratio, reason }) => [ratio, reason]), [
     [null, "Duplicate result key"], [null, "Failed or skipped"],
   ]);
+});
+
+test("workload families stay grouped across API lanes", () => {
+  assert.equal(benchmarkGroup(result(10, { test: "render.light" })), "light-render");
+  assert.equal(benchmarkGroup(result(10, { lane: "gl", test: "render.postfx" })), "heavy-render");
+  assert.equal(benchmarkGroup(result(10, { test: "compute.light" })), "light-compute");
+  assert.equal(benchmarkGroup(result(10, { test: "compute.conv2d" })), "heavy-compute");
+  assert.equal(benchmarkGroup(result(10, { lane: "rt", test: "rt.asbuild" })), "rays");
+  assert.equal(benchmarkGroup(result(10, { test: "transfer.ops" })), "memory");
+});
+
+test("group curation respects filtered cases and keeps different APIs and metrics separate", () => {
+  const group = BENCHMARK_GROUPS.find(({ id }) => id === "light-render");
+  const entry = (depth, api, primary, ratio) => ({
+    row: result(100, { depth, primary, params: { kind: "tri" } }),
+    api: { id: api },
+    ratio,
+    title: "Light rendering",
+  });
+  const first = entry(1, "vulkan", "fps", 1.2);
+  const alternateAPI = entry(1, "gl-native", "fps", 0.8);
+  const differentMetric = entry(1, "vulkan", "us_per_submit", 1.1);
+  const unmatched = entry(4, "vulkan", "fps", null);
+  const input = [first, alternateAPI, differentMetric, unmatched];
+  const cases = selectChartCases(group, input);
+  assert.equal(cases.length, 3);
+  assert.equal(cases[0].title, "Single triangle");
+  assert.ok(cases.every((selection) => selection.entries.length === 1));
+  assert.ok(cases.every((selection) => selection.row.depth === 1));
+  assert.deepEqual(selectChartCases(group, input.toReversed()), cases);
+  assert.deepEqual(selectChartCases(group, [unmatched]), []);
 });

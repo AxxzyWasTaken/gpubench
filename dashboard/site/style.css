@@ -179,11 +179,8 @@ th:first-child, td:first-child { padding-left: 20px; font-family: var(--sans); }
 }
 .series:disabled { cursor: default; opacity: .55; }
 
-.comparison {
-  margin-top: 16px;
-  --ratio-width: 4.4rem;
-  overflow: clip;
-}
+.comparison { margin-top: 16px; overflow: clip; }
+.benchmark-group { --ratio-width: 4.4rem; }
 .devices { grid-template-columns: repeat(4, 1fr); }
 .comparison-heading {
   display: flex; align-items: baseline; justify-content: space-between; gap: 12px;
@@ -293,7 +290,7 @@ th:first-child, td:first-child { padding-left: 20px; font-family: var(--sans); }
 }
 @media (max-width: 600px) {
   .devices { grid-template-columns: repeat(2, 1fr); }
-  .comparison { --ratio-width: 3.25rem; }
+  .benchmark-group { --ratio-width: 3.25rem; }
   .comparison-heading, .comparison-filters, .comparison-status { padding-inline: 11px; }
   .comparison-summary > div { padding: 7px 5px 8px 9px; }
   .comparison-summary dt { font-size: .6875rem; }
@@ -337,12 +334,22 @@ th:first-child, td:first-child { padding-left: 20px; font-family: var(--sans); }
   column-gap: 12px;
 }
 .workload-axis {
-  grid-column: 2; display: grid; grid-template-columns: repeat(5, minmax(0, 1fr));
-  font: .6875rem var(--mono); text-align: center; color: var(--muted); margin: 1px -12.5% 5px;
+  grid-column: 2; position: relative; min-height: 14px; margin: 1px 0 5px;
+  font: .6875rem var(--mono); color: var(--muted);
 }
-.workload-axis span:first-child, .workload-axis span:last-child { justify-self: center; }
-.workload-axis span:nth-child(3) { color: var(--foreground); font-weight: 650; }
-.workload-chart-name { align-self: center; font-size: .8125rem; font-weight: 570; }
+.workload-axis span { position: absolute; white-space: nowrap; }
+.workload-axis span:nth-child(2) { left: 25%; transform: translateX(-50%); }
+.workload-axis span:nth-child(3) {
+  left: 50%; transform: translateX(-50%); color: var(--foreground); font-weight: 650;
+}
+.workload-axis span:nth-child(4) { left: 75%; transform: translateX(-50%); }
+.workload-axis span:last-child { right: 0; }
+.workload-chart-name {
+  align-self: center; overflow-wrap: anywhere; font-size: .875rem; font-weight: 570;
+}
+.workload-chart-name small {
+  display: block; font-size: .6875rem; font-weight: 400; color: var(--muted);
+}
 .workload-chart-track {
   position: relative; display: grid; align-items: center; min-height: 45px;
   border-top: 1px solid var(--border);
@@ -365,7 +372,6 @@ th:first-child, td:first-child { padding-left: 20px; font-family: var(--sans); }
 }
 .workload-point[data-label-left] span { left: auto; right: calc(50% + 6px); }
 .workload-point:hover span, .workload-point:focus-visible span { color: var(--foreground); }
-.workload-chart-missing { color: var(--muted); font-size: .75rem; text-align: center; }
 .wins-overview { display: grid; gap: 12px; padding-top: 5px; }
 .win-label { display: flex; justify-content: space-between; align-items: baseline; gap: 8px; margin-bottom: 4px; }
 .win-label strong { font-size: .875rem; font-weight: 580; }
@@ -380,4 +386,56 @@ th:first-child, td:first-child { padding-left: 20px; font-family: var(--sans); }
 @media (max-width: 740px) {
   .overview { grid-template-columns: 1fr; }
   .overview-panel { padding-inline: 13px; }
+}
+
+.group-index {
+  padding: 14px 16px;
+}
+.group-index ul {
+  display: grid; grid-template-columns: repeat(2, minmax(0, 1fr)); gap: 7px 10px;
+  padding: 0; margin: 10px 0 0; list-style: none;
+}
+.group-index a {
+  min-height: 41px; display: flex; gap: 8px; align-items: center; justify-content: space-between;
+  padding: 6px 10px; background: var(--surface); border: 1px solid var(--border);
+  border-radius: 6px; text-decoration: none; font-size: .875rem; font-weight: 530;
+}
+.group-index a:hover { background: var(--hover); border-color: var(--muted); }
+.group-index small { font: .75rem var(--mono); color: var(--muted); }
+#benchmark-groups { display: grid; gap: 16px; margin-top: 16px; }
+#benchmark-groups:empty { display: none; }
+.benchmark-group { scroll-margin-top: 18px; }
+.benchmark-group:target { border-color: var(--muted); }
+.group-heading {
+  display: flex; justify-content: space-between; align-items: start; gap: 16px;
+  padding: 14px 18px 9px;
+}
+.group-heading p { color: var(--muted); font-size: .8125rem; margin-top: 2px; }
+.group-score { display: grid; justify-items: end; gap: 0; text-align: right; white-space: nowrap; }
+.group-score strong { color: var(--linux-lead); font: 600 1.125rem var(--mono); }
+.group-score small { color: var(--muted); font-size: .75rem; }
+.group-chart { padding: 4px 18px 12px; }
+.group-chart .workload-overview { grid-template-columns: minmax(125px, 23%) minmax(0, 1fr); }
+.group-chart .overview-key { padding-top: 9px; }
+.group-measurements { border-top: 1px solid var(--border); }
+.group-measurements[open] > summary { border-bottom: 1px solid var(--border); }
+.group-measurements th { z-index: 2; }
+.coverage-chart {
+  display: grid; grid-template-columns: repeat(2, minmax(0, 1fr)); gap: 12px 16px;
+  padding-top: 3px; max-width: 680px;
+}
+.coverage-chart .win-bar span { background: var(--vulkan); }
+@media (max-width: 600px) {
+  .group-index { padding-inline: 12px; }
+  .group-index ul { gap: 6px; }
+  .group-index a { padding-inline: 7px; font-size: .8125rem; }
+  .group-heading { padding: 12px 12px 8px; gap: 8px; }
+  .group-heading p { font-size: .75rem; }
+  .group-chart { padding-inline: 12px; }
+  .group-chart .workload-overview {
+    grid-template-columns: minmax(92px, 34%) minmax(0, 1fr); column-gap: 8px;
+  }
+  .workload-chart-name { font-size: .75rem; }
+  .workload-chart-name small { font-size: .625rem; }
+  .coverage-chart { gap: 9px 12px; }
 }
