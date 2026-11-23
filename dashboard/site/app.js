@@ -5,6 +5,7 @@ const DEVICES = [
   { id: "neo", name: "A18 Pro", model: "MacBook Neo" },
   { id: "m5-pro", name: "M5 Pro", model: "MacBook Pro" },
   { id: "m4-mini", name: "M4", model: "Mac mini" },
+  { id: "j775c", name: "M5 Max", model: "Mac Studio" },
 ];
 const APIS = [
   { id: "vulkan", name: "Vulkan", platform: "Linux" },
