@@ -1,4 +1,4 @@
-import { buildComparisons, canCompare, compatible, relative, workloadKey } from "./comparison.js?v=2";
+import { buildComparisons, canCompare, compatible, relative, workloadKey } from "./comparison.js?v=3";
 
 const DEVICES = [
   { id: "neo", name: "A18 Pro", model: "MacBook Neo" },
@@ -11,6 +11,13 @@ const APIS = [
   { id: "gl-zink", name: "OpenGL / Zink", platform: "Linux" },
   { id: "metal", name: "Metal", platform: "macOS" },
 ];
+const SPOTLIGHT_CASES = [
+  ["Heavy compute", "compute.heavy", { kind: "alu" }],
+  ["Memory bandwidth", "compute.heavy", { kind: "bw" }],
+  ["1080p fill", "render.heavy", { kind: "fill", res: "1080p" }],
+  ["Buffer copy", "copy.bw", { kind: "buf2buf" }],
+];
+const SPOTLIGHT_DEPTH = 4;
 const TEST_NAMES = {
   "submit.empty": "Empty submission",
   "compute.light": "Light compute",
@@ -48,7 +55,7 @@ const byId = (id) => document.getElementById(id);
 const theme = matchMedia("(prefers-color-scheme: dark)");
 const state = {
   device: "neo", comparisonDevice: "all", runs: [], comparisons: [],
-  hidden: new Set(), pinned: new Map(), plot: null,
+  hidden: new Set(), pinned: new Map(), plot: null, returnTarget: null,
 };
 const comparisonSearch = byId("comparison-search");
 const comparisonApi = byId("comparison-api");
@@ -59,6 +66,8 @@ const workloadSelect = byId("workload");
 const metricSelect = byId("metric");
 const viewSelect = byId("view");
 const canvas = byId("chart");
+const inspector = byId("workload-inspector");
+const returnToResult = byId("return-to-result");
 
 function node(tag, content, className) {
   const element = document.createElement(tag);
@@ -138,8 +147,10 @@ function renderDevices() {
       state.hidden.clear();
       state.pinned.clear();
       renderDevices();
+      renderOverview();
       renderComparison();
       renderWorkloads();
+      writeQuery();
       byId("devices").querySelector('[aria-pressed="true"]').focus({ preventScroll: true });
     });
     return button;
@@ -166,6 +177,96 @@ function makeComparisonRows(runs) {
       .join(" ").toLowerCase();
     return { ...pair, row, device, api, title, configuration, searchable, outcome: compareDelta(pair.ratio) };
   }).filter(Boolean);
+}
+
+function ratioText(ratio) {
+  return ratio === 1 ? "1.00" : ratio.toPrecision(Math.abs(ratio - 1) < 0.01 ? 5 : 3);
+}
+
+function axisRange(entries, minimum = 1) {
+  return Math.ceil(entries.reduce((max, entry) =>
+    entry.ratio == null ? max : Math.max(max, Math.abs(Math.log2(entry.ratio))), minimum));
+}
+
+function renderSpotlight() {
+  const devices = DEVICES.filter((device) => state.comparisonDevice === "all" || device.id === state.comparisonDevice);
+  const cases = SPOTLIGHT_CASES.map(([title, test, params]) => {
+    const key = workloadKey({ lane: "suite", test, params, mode: "queue" });
+    const entries = state.comparisons.filter(({ api, row, ratio }) =>
+      api.id === "vulkan" && row.depth === SPOTLIGHT_DEPTH && ratio != null && workloadKey(row) === key);
+    return { title, entries };
+  });
+  const extent = axisRange(cases.flatMap(({ entries }) => entries), 2);
+  const axis = node("div", null, "workload-axis");
+  for (const position of [-1, -0.5, 0, 0.5, 1]) {
+    axis.append(node("span", `${axisNumber.format(2 ** (extent * position))}×`));
+  }
+
+  const chart = byId("workload-overview");
+  chart.replaceChildren(axis);
+  for (const { title, entries } of cases) {
+    const track = node("div", null, "workload-chart-track");
+    for (const device of devices) {
+      const entry = entries.find((item) => item.device.id === device.id);
+      const lane = node("div", null, "workload-chart-lane");
+      if (entry) {
+        const position = 50 + Math.log2(entry.ratio) * 50 / extent;
+        const label = `${ratioText(entry.ratio)}×`;
+        const button = node("button", null, `workload-point chart-${device.id}`);
+        button.type = "button";
+        button.style.setProperty("--point", `${position}%`);
+        if (position >= 81) button.dataset.labelLeft = "";
+        button.title = `${title} · ${device.name} · ${label} Metal`;
+        button.setAttribute("aria-label", button.title);
+        button.append(node("span", label));
+        button.addEventListener("click", () => inspectComparison(entry, button));
+        lane.append(button);
+      }
+      track.append(lane);
+    }
+    if (!track.querySelector("button")) track.replaceChildren(node("span", "No matched result", "workload-chart-missing"));
+    chart.append(node("span", title, "workload-chart-name"), track);
+  }
+  byId("workload-key").replaceChildren(...devices.map((device) => {
+    const key = node("span", null, `chip-key chart-${device.id}`);
+    key.append(node("i"), document.createTextNode(device.name));
+    return key;
+  }));
+}
+
+function renderWinShares() {
+  const rows = DEVICES.map((device) => {
+    const entries = state.comparisons.filter((entry) => entry.device.id === device.id && entry.ratio != null);
+    const wins = entries.filter((entry) => entry.outcome === "linux").length;
+    const losses = entries.filter((entry) => entry.outcome === "metal").length;
+    const ties = entries.length - wins - losses;
+    const row = node("div");
+    const label = node("div", null, "win-label");
+    const summary = entries.length ? `${wins}/${entries.length} · ${percent.format(wins / entries.length)}` : "No matches";
+    label.append(node("strong", device.name), node("span", summary, "technical"));
+    const bar = node("div", null, "win-bar");
+    bar.setAttribute("role", "img");
+    bar.setAttribute("aria-label", `${device.name}, Linux faster in ${wins}, Metal faster in ${losses}, ${ties} exact ties`);
+    for (const [count, className, outcome] of [
+      [wins, "linux-lead", "Linux faster"], [losses, "metal-lead", "Metal faster"], [ties, "exact-tie", "Exact ties"],
+    ]) {
+      if (!count) continue;
+      const segment = node("span", null, className);
+      segment.title = `${outcome} · ${count}`;
+      segment.style.flexGrow = count;
+      bar.append(segment);
+    }
+    row.append(label, bar);
+    return row;
+  });
+  const axis = node("div", null, "win-axis");
+  axis.append(node("span", "0%"), node("span", "50%"), node("span", "100%"));
+  byId("wins-overview").replaceChildren(...rows, axis);
+}
+
+function renderOverview() {
+  renderSpotlight();
+  renderWinShares();
 }
 
 function renderComparison() {
@@ -199,7 +300,7 @@ function renderComparison() {
   }));
 
   const result = comparisonResult.value;
-  const visible = filtered.filter((row) => !result ||
+  const visible = filtered.filter((row) => result === "all" ||
     (result === "matched" ? row.outcome !== "unmatched" : row.outcome === result));
   const order = comparisonSort.value;
   visible.sort((a, b) => {
@@ -212,8 +313,7 @@ function renderComparison() {
       a.api.name.localeCompare(b.api.name);
   });
 
-  const extent = Math.ceil(visible.reduce((max, row) =>
-    row.ratio == null ? max : Math.max(max, Math.abs(Math.log2(row.ratio))), 1));
+  const extent = axisRange(visible);
   byId("axis-min").textContent = `${axisNumber.format(2 ** -extent)}×`;
   byId("axis-max").textContent = `${axisNumber.format(2 ** extent)}×`;
   byId("comparison-rows").replaceChildren(...visible.map((entry) => renderComparisonRow(entry, extent)));
@@ -224,7 +324,6 @@ function renderComparison() {
     : "No results for these filters.";
   byId("comparison-status").textContent =
     `${number.format(visible.length)} shown · ${number.format(matched)} matched · ${number.format(counts.unmatched)} unmatched`;
-  byId("comparison-scroll").scrollTop = 0;
 }
 
 function renderComparisonRow(entry, extent) {
@@ -235,7 +334,7 @@ function renderComparisonRow(entry, extent) {
   inspect.type = "button";
   inspect.title = `${row.test} · ${configuration} · ${device.name} · ${api.name}`;
   inspect.setAttribute("aria-label", `Inspect ${inspect.title}`);
-  inspect.addEventListener("click", () => inspectComparison(entry));
+  inspect.addEventListener("click", () => inspectComparison(entry, inspect));
   const detail = node("span", configuration, "comparison-params technical");
   detail.title = configuration;
   workload.append(inspect, detail, node("span", `${device.name} · ${api.name}`, "comparison-mobile-stack"));
@@ -270,7 +369,7 @@ function renderComparisonRow(entry, extent) {
     if (ratio === 1) bar.dataset.tie = "";
     track.append(bar);
 
-    const precise = ratio === 1 ? "1.00" : ratio.toPrecision(Math.abs(ratio - 1) < 0.01 ? 5 : 3);
+    const precise = ratioText(ratio);
     const label = node("span", `${precise}×`, "comparison-number");
     const direction = { linux: "Linux faster", metal: "Metal faster", tied: "Exact tie" }[entry.outcome];
     label.setAttribute("aria-label", `${precise} times Metal, ${direction}`);
@@ -282,25 +381,24 @@ function renderComparisonRow(entry, extent) {
   return result;
 }
 
-function inspectComparison(entry) {
+function inspectComparison(entry, returnTarget) {
   state.device = entry.device.id;
+  state.returnTarget = returnTarget;
+  returnToResult.hidden = false;
   state.hidden.clear();
   state.pinned.clear();
   for (const source of [entry.linux, entry.metal]) {
     if (source) state.pinned.set(source.run.api, source.run.id);
   }
   viewSelect.value = entry.ratio == null ? "raw" : "relative";
-  byId("workload-inspector").open = true;
-  renderWorkloads(workloadKey(entry.row));
-  if ([...metricSelect.options].some((option) => option.value === entry.row.primary)) {
-    metricSelect.value = entry.row.primary;
-    render();
-  }
-  byId("workload-inspector").scrollIntoView({ block: "start" });
+  inspector.open = true;
+  renderWorkloads(workloadKey(entry.row), entry.row.primary);
+  writeQuery();
+  inspector.scrollIntoView({ block: "start" });
   workloadSelect.focus({ preventScroll: true });
 }
 
-function renderWorkloads(previous = workloadSelect.value) {
+function renderWorkloads(previous = workloadSelect.value, requestedMetric = metricSelect.value) {
   byId("inspector-device").textContent = DEVICES.find((device) => device.id === state.device).name;
   const unique = new Map();
   for (const run of state.runs.filter((record) => record.device === state.device)) {
@@ -321,17 +419,16 @@ function renderWorkloads(previous = workloadSelect.value) {
   }));
   const initial = workloadKey({ lane: "suite", test: "compute.heavy", params: { kind: "alu" }, mode: "queue" });
   workloadSelect.value = unique.has(previous) ? previous : unique.has(initial) ? initial : [...unique.keys()][0];
-  render(true);
+  render(true, requestedMetric);
 }
 
-function render(resetMetrics = false) {
+function render(resetMetrics = false, requestedMetric = metricSelect.value) {
   const key = workloadSelect.value;
   const records = recordsFor(key);
   const row = records.find((record) => record.rows?.length)?.rows[0];
   if (!row) return;
 
   if (resetMetrics) {
-    const previous = metricSelect.value;
     const names = new Map();
     let primary;
     for (const record of records) {
@@ -342,7 +439,7 @@ function render(resetMetrics = false) {
     }
     metricSelect.replaceChildren(...[...names].map(([id, name]) => new Option(name, id)));
     metricSelect.disabled = !names.size;
-    if (names.has(previous)) metricSelect.value = previous;
+    if (names.has(requestedMetric)) metricSelect.value = requestedMetric;
     else if (primary) metricSelect.value = primary;
   }
   const metric = metricSelect.value;
@@ -395,6 +492,7 @@ function renderLegend(series) {
       if (pressed) state.hidden.add(record.id);
       else state.hidden.delete(record.id);
       render();
+      writeQuery();
       byId("legend").querySelectorAll("button").forEach((item) => {
         if (item.textContent === record.name) item.focus({ preventScroll: true });
       });
@@ -479,6 +577,7 @@ function renderRecords(series) {
           if (select.value) state.pinned.set(api.id, select.value);
           else state.pinned.delete(api.id);
           render(true);
+          writeQuery();
           byId("records").querySelectorAll("select").forEach((item) => {
             if (item.getAttribute("aria-label") === select.getAttribute("aria-label")) item.focus({ preventScroll: true });
           });
@@ -652,17 +751,74 @@ async function fetchFeed(url, signal) {
   return feed;
 }
 
+function setFilter(select, value, fallback = "") {
+  select.value = [...select.options].some((option) => option.value === value) ? value : fallback;
+}
+
+function restoreQuery() {
+  const params = new URLSearchParams(location.search);
+  const selected = DEVICES.find((device) => device.id === params.get("chip"));
+  const detail = DEVICES.find((device) => device.id === params.get("inspect-chip"));
+  state.comparisonDevice = selected?.id ?? "all";
+  state.device = detail?.id ?? selected?.id ?? DEVICES.find((device) =>
+    state.runs.some((run) => run.device === device.id)).id;
+  state.returnTarget = null;
+  returnToResult.hidden = true;
+
+  comparisonSearch.value = params.get("q") ?? "";
+  setFilter(comparisonApi, params.get("api"));
+  setFilter(comparisonResult, params.get("results"), "matched");
+  setFilter(comparisonSort, params.get("sort"), "linux");
+  inspector.open = params.has("workload");
+  setFilter(viewSelect, params.get("view"), "raw");
+  const hidden = (params.get("hide") ?? "").split(",");
+  state.hidden = new Set(APIS.filter((api) => hidden.includes(api.id)).map((api) => api.id));
+  state.pinned.clear();
+  for (const id of params.getAll("run")) {
+    const run = state.runs.find((item) => item.id === id && item.device === state.device);
+    if (run) state.pinned.set(run.api, id);
+  }
+
+  renderDevices();
+  renderOverview();
+  renderComparison();
+  renderWorkloads(params.get("workload") ?? "", params.get("metric") ?? "");
+}
+
+function writeQuery(method = "pushState") {
+  const url = new URL(location.href);
+  const params = url.searchParams;
+  const values = {
+    chip: state.comparisonDevice === "all" ? "" : state.comparisonDevice,
+    q: comparisonSearch.value.trim(),
+    api: comparisonApi.value,
+    results: comparisonResult.value === "matched" ? "" : comparisonResult.value,
+    sort: comparisonSort.value === "linux" ? "" : comparisonSort.value,
+    "inspect-chip": inspector.open && state.device !== state.comparisonDevice ? state.device : "",
+    workload: inspector.open ? workloadSelect.value : "",
+    metric: inspector.open ? metricSelect.value : "",
+    view: inspector.open && viewSelect.value !== "raw" ? viewSelect.value : "",
+    hide: inspector.open ? [...state.hidden].join(",") : "",
+  };
+  for (const [key, value] of Object.entries(values)) {
+    if (value) params.set(key, value);
+    else params.delete(key);
+  }
+  params.delete("run");
+  if (inspector.open) {
+    for (const id of state.pinned.values()) params.append("run", id);
+  }
+  if (url.href !== location.href) history[method](null, "", url);
+}
+
 function applyFeed(feed) {
   state.runs = feed.runs.toSorted((a, b) => b.date.localeCompare(a.date));
   state.comparisons = makeComparisonRows(state.runs);
   const device = DEVICES.find((item) => state.runs.some((run) => run.device === item.id));
   if (!device) throw new Error("No supported devices in benchmark feed");
-  if (!state.runs.some((run) => run.device === state.device)) state.device = device.id;
   byId("explorer").hidden = false;
   byId("load-status").hidden = true;
-  renderDevices();
-  renderComparison();
-  renderWorkloads();
+  restoreQuery();
 }
 
 async function start() {
@@ -690,10 +846,28 @@ async function start() {
   }
 }
 
-comparisonSearch.addEventListener("input", renderComparison);
+comparisonSearch.addEventListener("input", () => {
+  renderComparison();
+  writeQuery("replaceState");
+});
 for (const filter of [comparisonApi, comparisonResult, comparisonSort]) {
-  filter.addEventListener("change", renderComparison);
+  filter.addEventListener("change", () => { renderComparison(); writeQuery(); });
 }
+window.addEventListener("popstate", () => {
+  if (state.runs.length) restoreQuery();
+});
+inspector.addEventListener("toggle", () => {
+  if (inspector.open !== new URLSearchParams(location.search).has("workload")) writeQuery();
+});
+returnToResult.addEventListener("click", () => {
+  inspector.open = false;
+  writeQuery();
+  const result = state.returnTarget?.isConnected ? state.returnTarget : byId("comparison-title");
+  result.scrollIntoView({ block: "center" });
+  if (result === state.returnTarget) result.focus({ preventScroll: true });
+  state.returnTarget = null;
+  returnToResult.hidden = true;
+});
 byId("comparison-title").nextElementSibling.addEventListener("click", () => { byId("methodology").open = true; });
 canvas.addEventListener("pointermove", inspectPoint);
 canvas.addEventListener("pointerdown", inspectPoint);
@@ -703,9 +877,9 @@ canvas.addEventListener("pointerleave", () => {
   byId("chart-tooltip").hidden = true;
   drawChart();
 });
-workloadSelect.addEventListener("change", () => { state.pinned.clear(); render(true); });
-metricSelect.addEventListener("change", () => render());
-viewSelect.addEventListener("change", () => render(true));
+workloadSelect.addEventListener("change", () => { state.pinned.clear(); render(true); writeQuery(); });
+metricSelect.addEventListener("change", () => { render(); writeQuery(); });
+viewSelect.addEventListener("change", () => { render(true); writeQuery(); });
 new ResizeObserver(drawChart).observe(canvas);
 theme.addEventListener("change", drawChart);
 document.fonts.ready.then(drawChart);
