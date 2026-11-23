@@ -7,10 +7,12 @@ const DEVICES = [
   { id: "m4-mini", name: "M4", model: "Mac mini" },
   { id: "j616s", name: "M4 Pro", model: "MacBook Pro" },
   { id: "j713", name: "M4 Air", model: "MacBook Air" },
-  { id: "j615", name: "M3", model: "MacBook Air" },
+  { id: "j615", name: "M3 Air 15-inch", model: "MacBook Air" },
   { id: "j413", name: "M2", model: "MacBook Air" },
   { id: "m1pro", name: "M1 Pro", model: "MacBook Pro" },
   { id: "j700", name: "A18 Pro (lab)", model: "MacBook Neo (Aurora lab)" },
+  { id: "j775c", name: "M5 Max", model: "Mac Studio" },
+  { id: "j613", name: "M3", model: "MacBook Air 13-inch (J613)" },
 ];
 const APIS = [
   { id: "vulkan", name: "Vulkan", platform: "Linux" },
@@ -139,6 +141,11 @@ function recordsFor(key) {
   });
 }
 
+function defaultResult(device) {
+  const hasMatches = state.comparisons.some((entry) => entry.device.id === device && entry.ratio != null);
+  return device === "all" || hasMatches ? "matched" : "all";
+}
+
 function renderDevices() {
   const all = { id: "all", name: "All chips" };
   byId("devices").replaceChildren(...[all, ...DEVICES].map((device) => {
@@ -149,7 +156,9 @@ function renderDevices() {
     if (device.model) button.append(node("span", device.model));
     button.addEventListener("click", () => {
       if (state.comparisonDevice === device.id) return;
+      const usingDefault = comparisonResult.value === defaultResult(state.comparisonDevice);
       state.comparisonDevice = device.id;
+      if (usingDefault) comparisonResult.value = defaultResult(device.id);
       if (device.id !== "all") state.device = device.id;
       state.hidden.clear();
       state.pinned.clear();
@@ -875,7 +884,7 @@ function restoreQuery() {
 
   comparisonSearch.value = params.get("q") ?? "";
   setFilter(comparisonApi, params.get("api"));
-  setFilter(comparisonResult, params.get("results"), "matched");
+  setFilter(comparisonResult, params.get("results"), defaultResult(state.comparisonDevice));
   setFilter(comparisonSort, params.get("sort"), "linux");
   inspector.open = params.has("workload");
   setFilter(viewSelect, params.get("view"), "raw");
@@ -899,7 +908,7 @@ function writeQuery(method = "pushState") {
     chip: state.comparisonDevice === "all" ? "" : state.comparisonDevice,
     q: comparisonSearch.value.trim(),
     api: comparisonApi.value,
-    results: comparisonResult.value === "matched" ? "" : comparisonResult.value,
+    results: comparisonResult.value === defaultResult(state.comparisonDevice) ? "" : comparisonResult.value,
     sort: comparisonSort.value === "linux" ? "" : comparisonSort.value,
     tables: [...state.openGroups].join(","),
     "inspect-chip": inspector.open && state.device !== state.comparisonDevice ? state.device : "",
