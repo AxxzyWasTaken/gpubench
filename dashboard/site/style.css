@@ -17,6 +17,7 @@
   --gl-zink: #8a43a2;
   --linux-lead: var(--vulkan);
   --metal-lead: #a04e13;
+  --chart-j775c: #6b4f2a;
   --chart-j613: #4a5a7a;
   --sans: Geist, -apple-system, BlinkMacSystemFont, "Segoe UI", sans-serif;
   --mono: "Geist Mono", ui-monospace, "SFMono-Regular", Consolas, monospace;
@@ -40,6 +41,7 @@
     --gl-native: #68d4b6;
     --gl-zink: #d3a0e3;
     --metal-lead: #ecab72;
+    --chart-j775c: #d8b48a;
     --chart-j613: #a9b8d8;
   }
 }
@@ -180,7 +182,7 @@ th:first-child, td:first-child { padding-left: 20px; font-family: var(--sans); }
 
 .comparison { margin-top: 16px; overflow: clip; }
 .benchmark-group { --ratio-width: 4.4rem; }
-.devices { grid-template-columns: repeat(4, 1fr); }
+.devices { grid-template-columns: repeat(auto-fit, minmax(min(100%, 158px), 1fr)); }
 .comparison-heading {
   display: flex; align-items: baseline; justify-content: space-between; gap: 12px;
   padding: 14px 18px 11px;
@@ -326,6 +328,7 @@ th:first-child, td:first-child { padding-left: 20px; font-family: var(--sans); }
 .chart-neo { --chip-tone: var(--vulkan); }
 .chart-m5-pro { --chip-tone: var(--gl-native); }
 .chart-m4-mini { --chip-tone: var(--gl-zink); }
+.chart-j775c { --chip-tone: var(--chart-j775c); }
 .chart-j613 { --chip-tone: var(--chart-j613); }
 .exact-tie { color: var(--metal); }
 
