@@ -19,7 +19,7 @@ The importer replaces the entry for that device, API and UTC timestamp. It proje
 
 The site reads the public GitHub feed on page load, so data-only commits appear after GitHub's cache refresh without a Pages upload. A copy of the feed ships with each deployment. Future imports require the saved artifacts from a device thread.
 
-The chart selects one run per API per workload. Readers can select an older run from the Run Records section. Metal-relative values require matching device, lane, test, params, mode, depth, metric, unit and improvement direction. Runs with an unknown or dirty suite revision remain visible in measured mode. The table retains duplicate keys, skipped cases and failures. The chart omits those measurements.
+The comparison table selects the newest run with a recorded, clean suite revision per chip, API and configuration. It counts each paired depth once for each Linux API. The comparison uses the primary metric. Duplicate keys, failures and skipped results go to Unmatched. The workload chart selects one run per API per workload. Readers can select an older run from the Run Records section. Metal-relative values require matching device, lane, test, params, mode, depth, metric, unit and improvement direction. Runs with an unknown or dirty suite revision remain visible in measured mode. The table retains duplicate keys, skipped cases and failures. The chart omits those measurements.
 
 ## Deploy the site
 
@@ -29,6 +29,8 @@ From this repository's `gpu-dashboard` branch, run:
 cd dashboard
 npx --yes wrangler@4.166.0 pages deploy --branch gpu-dashboard
 ```
+
+Run the matching and ratio checks with `node --test dashboard/comparison.test.mjs`.
 
 To serve a local copy:
 

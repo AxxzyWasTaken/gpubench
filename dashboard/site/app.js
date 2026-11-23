@@ -1,3 +1,5 @@
+import { buildComparisons, canCompare, compatible, relative, workloadKey } from "./comparison.js";
+
 const DEVICES = [
   { id: "neo", name: "A18 Pro", model: "MacBook Neo" },
   { id: "m5-pro", name: "M5 Pro", model: "MacBook Pro" },
@@ -17,6 +19,9 @@ const TEST_NAMES = {
   "render.heavy": "Heavy rendering",
   "copy.bw": "Copy bandwidth",
   "render.tvb": "Tile vertex buffer",
+  "mem.image": "Image allocation",
+  "mem.buffer": "Buffer allocation",
+  query: "Query overhead",
   "rt.scene": "Ray-tracing scene",
   "compile.pso": "Pipeline compilation",
 };
@@ -41,7 +46,15 @@ const axisNumber = new Intl.NumberFormat(undefined, { maximumSignificantDigits: 
 const dateFormat = new Intl.DateTimeFormat("en", { dateStyle: "medium", timeZone: "UTC" });
 const byId = (id) => document.getElementById(id);
 const theme = matchMedia("(prefers-color-scheme: dark)");
-const state = { device: "neo", runs: [], hidden: new Set(), pinned: new Map(), plot: null };
+const state = {
+  device: "neo", comparisonDevice: "all", runs: [], comparisons: [],
+  hidden: new Set(), pinned: new Map(), plot: null,
+};
+const comparisonSearch = byId("comparison-search");
+const comparisonApi = byId("comparison-api");
+const comparisonResult = byId("comparison-result");
+const comparisonSort = byId("comparison-sort");
+const percent = new Intl.NumberFormat(undefined, { style: "percent", maximumFractionDigits: 1 });
 const workloadSelect = byId("workload");
 const metricSelect = byId("metric");
 const viewSelect = byId("view");
@@ -52,18 +65,6 @@ function node(tag, content, className) {
   if (content != null) element.textContent = content;
   if (className) element.className = className;
   return element;
-}
-
-function sortedObject(value) {
-  if (Array.isArray(value)) return value.map(sortedObject);
-  if (value && typeof value === "object") {
-    return Object.fromEntries(Object.keys(value).sort().map((key) => [key, sortedObject(value[key])]));
-  }
-  return value;
-}
-
-function workloadKey(row) {
-  return JSON.stringify([row.lane, row.test, sortedObject(row.params), row.mode]);
 }
 
 function workloadName(row) {
@@ -122,31 +123,22 @@ function recordsFor(key) {
   });
 }
 
-function compatible(metric, reference) {
-  return reference && metric.unit === reference.unit && metric.better === reference.better;
-}
-
-function relative(metric, reference) {
-  if (!compatible(metric, reference) || metric.median <= 0 || reference.median <= 0) return null;
-  return metric.better === "lower" ? reference.median / metric.median : metric.median / reference.median;
-}
-
-function canCompare(run) {
-  return Boolean(run?.suite && !run.suite.includes("+dirty"));
-}
-
 function renderDevices() {
-  byId("devices").replaceChildren(...DEVICES.map((device) => {
+  const all = { id: "all", name: "All chips" };
+  byId("devices").replaceChildren(...[all, ...DEVICES].map((device) => {
     const button = node("button", null, "device");
     button.type = "button";
-    button.setAttribute("aria-pressed", String(device.id === state.device));
-    button.append(node("strong", device.name), node("span", device.model));
+    button.setAttribute("aria-pressed", String(device.id === state.comparisonDevice));
+    button.append(node("strong", device.name));
+    if (device.model) button.append(node("span", device.model));
     button.addEventListener("click", () => {
-      if (state.device === device.id) return;
-      state.device = device.id;
+      if (state.comparisonDevice === device.id) return;
+      state.comparisonDevice = device.id;
+      if (device.id !== "all") state.device = device.id;
       state.hidden.clear();
       state.pinned.clear();
       renderDevices();
+      renderComparison();
       renderWorkloads();
       byId("devices").querySelector('[aria-pressed="true"]').focus({ preventScroll: true });
     });
@@ -154,8 +146,162 @@ function renderDevices() {
   }));
 }
 
-function renderWorkloads() {
-  const previous = workloadSelect.value;
+function compareDelta(ratio) {
+  if (ratio == null) return "unmatched";
+  if (ratio > 1) return "linux";
+  if (ratio < 1) return "metal";
+  return "tied";
+}
+
+function makeComparisonRows(runs) {
+  return buildComparisons(runs).map((pair) => {
+    const { row, run } = pair.linux ?? pair.metal;
+    const device = DEVICES.find((item) => item.id === run.device);
+    const api = APIS.find((item) => item.id === pair.api);
+    if (!device || !api) return null;
+    const params = Object.entries(row.params).map(([key, value]) => `${key}=${value}`);
+    const configuration = [`Depth ${row.depth}`, row.mode !== "queue" && row.mode, ...params].filter(Boolean).join(" · ");
+    const title = TEST_NAMES[row.test] ?? row.test;
+    const searchable = [row.test, workloadName(row), device.name, device.model, api.name, groupName(row), configuration]
+      .join(" ").toLowerCase();
+    return { ...pair, row, device, api, title, configuration, searchable, outcome: compareDelta(pair.ratio) };
+  }).filter(Boolean);
+}
+
+function renderComparison() {
+  const available = state.comparisons.filter((entry) =>
+    state.comparisonDevice === "all" || entry.device.id === state.comparisonDevice);
+  for (const option of comparisonApi.options) {
+    option.disabled = Boolean(option.value && !available.some((entry) => entry.api.id === option.value));
+  }
+  if (comparisonApi.selectedOptions[0]?.disabled) comparisonApi.value = "";
+
+  const query = comparisonSearch.value.trim().toLowerCase().split(/\s+/).filter(Boolean);
+  const filtered = available.filter((entry) =>
+    (!comparisonApi.value || comparisonApi.value === entry.api.id) &&
+    query.every((term) => entry.searchable.includes(term)));
+  const counts = { linux: 0, metal: 0, tied: 0, unmatched: 0 };
+  for (const entry of filtered) counts[entry.outcome]++;
+  const matched = counts.linux + counts.metal + counts.tied;
+  const resultStats = [
+    ["Matched", matched, null, ""],
+    ["Linux faster", counts.linux, matched && percent.format(counts.linux / matched), "linux-lead"],
+    ["Metal faster", counts.metal, matched && percent.format(counts.metal / matched), "metal-lead"],
+    ["Exact ties", counts.tied, matched && percent.format(counts.tied / matched), ""],
+  ];
+  byId("comparison-summary").replaceChildren(...resultStats.map(([label, total, share, className]) => {
+    const item = node("div");
+    const value = node("dd", null, className);
+    value.append(node("span", number.format(total)));
+    if (share) value.append(node("small", share));
+    item.append(node("dt", label), value);
+    return item;
+  }));
+
+  const result = comparisonResult.value;
+  const visible = filtered.filter((row) => !result ||
+    (result === "matched" ? row.outcome !== "unmatched" : row.outcome === result));
+  const order = comparisonSort.value;
+  visible.sort((a, b) => {
+    if (order !== "workload") {
+      if ((a.ratio == null) !== (b.ratio == null)) return a.ratio == null ? 1 : -1;
+      if (a.ratio != null && a.ratio !== b.ratio) return order === "linux" ? b.ratio - a.ratio : a.ratio - b.ratio;
+    }
+    return a.title.localeCompare(b.title) || a.row.depth - b.row.depth ||
+      a.configuration.localeCompare(b.configuration) || a.device.name.localeCompare(b.device.name) ||
+      a.api.name.localeCompare(b.api.name);
+  });
+
+  const extent = Math.ceil(visible.reduce((max, row) =>
+    row.ratio == null ? max : Math.max(max, Math.abs(Math.log2(row.ratio))), 1));
+  byId("axis-min").textContent = `${axisNumber.format(2 ** -extent)}×`;
+  byId("axis-max").textContent = `${axisNumber.format(2 ** extent)}×`;
+  byId("comparison-rows").replaceChildren(...visible.map((entry) => renderComparisonRow(entry, extent)));
+  const empty = byId("comparison-empty");
+  empty.hidden = Boolean(visible.length);
+  empty.textContent = result === "matched" && counts.unmatched
+    ? "No Metal matches for these filters. Switch Results to Unmatched to see the available measurements."
+    : "No results for these filters.";
+  byId("comparison-status").textContent =
+    `${number.format(visible.length)} shown · ${number.format(matched)} matched · ${number.format(counts.unmatched)} unmatched`;
+  byId("comparison-scroll").scrollTop = 0;
+}
+
+function renderComparisonRow(entry, extent) {
+  const { row, device, api, ratio, configuration, linux, metal, linuxMetric, metalMetric } = entry;
+  const result = node("tr");
+  const workload = node("td");
+  const inspect = node("button", entry.title, "comparison-workload");
+  inspect.type = "button";
+  inspect.title = `${row.test} · ${configuration} · ${device.name} · ${api.name}`;
+  inspect.setAttribute("aria-label", `Inspect ${inspect.title}`);
+  inspect.addEventListener("click", () => inspectComparison(entry));
+  const detail = node("span", configuration, "comparison-params technical");
+  detail.title = configuration;
+  workload.append(inspect, detail, node("span", `${device.name} · ${api.name}`, "comparison-mobile-stack"));
+
+  const stack = node("td", null, "comparison-stack");
+  stack.append(node("span", api.name), node("span", device.name, "comparison-chip"));
+  const linuxValue = linuxMetric ? displayValue(linuxMetric.median, linuxMetric.unit) : "—";
+  const metalValue = metalMetric ? displayValue(metalMetric.median, metalMetric.unit) : "—";
+  const mobileValues = node("span", null, "comparison-mobile technical");
+  mobileValues.append(node("span", `L ${linuxValue}`), node("span", `M ${metalValue}`));
+  workload.append(mobileValues);
+  const left = node("td", linuxValue, "comparison-median");
+  const right = node("td", metalValue, "comparison-median");
+  for (const [cell, source] of [[left, linux], [right, metal]]) {
+    if (source) {
+      cell.title = [metricName(source.row.primary ?? "unavailable"),
+        dateFormat.format(new Date(source.run.date)), source.run.build, source.run.suite].filter(Boolean).join(" · ");
+    }
+  }
+
+  const parity = node("td");
+  if (ratio == null) {
+    parity.append(node("div", entry.reason, "comparison-unmatched"));
+  } else {
+    const className = entry.outcome === "linux" ? "linux-lead" : entry.outcome === "metal" ? "metal-lead" : "";
+    const content = node("div", null, `comparison-ratio ${className}`);
+    const track = node("span", null, `parity-track ${className}`);
+    track.setAttribute("aria-hidden", "true");
+    const bar = node("span", null, "bar");
+    const magnitude = Math.abs(Math.log2(ratio));
+    bar.style.setProperty("--bar-size", `${Math.max(0.6, magnitude * 50 / extent)}%`);
+    if (ratio === 1) bar.dataset.tie = "";
+    track.append(bar);
+
+    const precise = ratio === 1 ? "1.00" : ratio.toPrecision(Math.abs(ratio - 1) < 0.01 ? 5 : 3);
+    const label = node("span", `${precise}×`, "comparison-number");
+    const direction = { linux: "Linux faster", metal: "Metal faster", tied: "Exact tie" }[entry.outcome];
+    label.setAttribute("aria-label", `${precise} times Metal, ${direction}`);
+    content.title = `${precise}× Metal · ${direction}`;
+    content.append(track, label);
+    parity.append(content);
+  }
+  result.append(workload, stack, left, right, parity);
+  return result;
+}
+
+function inspectComparison(entry) {
+  state.device = entry.device.id;
+  state.hidden.clear();
+  state.pinned.clear();
+  for (const source of [entry.linux, entry.metal]) {
+    if (source) state.pinned.set(source.run.api, source.run.id);
+  }
+  viewSelect.value = entry.ratio == null ? "raw" : "relative";
+  byId("workload-inspector").open = true;
+  renderWorkloads(workloadKey(entry.row));
+  if ([...metricSelect.options].some((option) => option.value === entry.row.primary)) {
+    metricSelect.value = entry.row.primary;
+    render();
+  }
+  byId("workload-inspector").scrollIntoView({ block: "start" });
+  workloadSelect.focus({ preventScroll: true });
+}
+
+function renderWorkloads(previous = workloadSelect.value) {
+  byId("inspector-device").textContent = DEVICES.find((device) => device.id === state.device).name;
   const unique = new Map();
   for (const run of state.runs.filter((record) => record.device === state.device)) {
     for (const row of run.rows) unique.set(workloadKey(row), row);
@@ -508,12 +654,14 @@ async function fetchFeed(url, signal) {
 
 function applyFeed(feed) {
   state.runs = feed.runs.toSorted((a, b) => b.date.localeCompare(a.date));
+  state.comparisons = makeComparisonRows(state.runs);
   const device = DEVICES.find((item) => state.runs.some((run) => run.device === item.id));
   if (!device) throw new Error("No supported devices in benchmark feed");
   if (!state.runs.some((run) => run.device === state.device)) state.device = device.id;
   byId("explorer").hidden = false;
   byId("load-status").hidden = true;
   renderDevices();
+  renderComparison();
   renderWorkloads();
 }
 
@@ -542,6 +690,11 @@ async function start() {
   }
 }
 
+comparisonSearch.addEventListener("input", renderComparison);
+for (const filter of [comparisonApi, comparisonResult, comparisonSort]) {
+  filter.addEventListener("change", renderComparison);
+}
+byId("comparison-title").nextElementSibling.addEventListener("click", () => { byId("methodology").open = true; });
 canvas.addEventListener("pointermove", inspectPoint);
 canvas.addEventListener("pointerdown", inspectPoint);
 canvas.addEventListener("pointerleave", () => {

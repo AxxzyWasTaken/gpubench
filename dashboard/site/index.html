@@ -35,36 +35,100 @@
     <section id="explorer" aria-label="Benchmark explorer" hidden>
       <div class="devices" id="devices" role="group" aria-label="Device"></div>
 
-      <section class="panel" aria-labelledby="workload-title">
-        <div class="filters">
-          <label>Workload<select id="workload"></select></label>
-          <label>Metric<select id="metric"></select></label>
-          <label>View<select id="view"><option value="raw">Measured values</option><option value="relative">Relative to Metal</option></select></label>
+      <section class="panel comparison" aria-labelledby="comparison-title">
+        <div class="comparison-heading">
+          <h2 id="comparison-title">Linux vs Metal</h2>
+          <a class="text-link" href="#methodology">Methodology</a>
         </div>
-        <div class="panel-heading">
-          <div>
-            <h2 id="workload-title"></h2>
-            <p id="workload-detail" class="technical"></p>
-          </div>
-          <span id="direction" class="technical"></span>
+        <dl id="comparison-summary" class="comparison-summary"></dl>
+        <div class="filters comparison-filters">
+          <label>Search<input id="comparison-search" type="search" placeholder="Workload or chip"></label>
+          <label>Linux API
+            <select id="comparison-api">
+              <option value="">All APIs</option>
+              <option value="vulkan">Vulkan</option>
+              <option value="gl-native">OpenGL</option>
+              <option value="gl-zink">OpenGL / Zink</option>
+            </select>
+          </label>
+          <label>Results
+            <select id="comparison-result">
+              <option value="matched">Matched</option>
+              <option value="linux">Linux leads</option>
+              <option value="metal">Metal leads</option>
+              <option value="tied">Exact ties</option>
+              <option value="unmatched">Unmatched</option>
+              <option value="">All results</option>
+            </select>
+          </label>
+          <label>Sort
+            <select id="comparison-sort">
+              <option value="linux">Linux lead first</option>
+              <option value="metal">Metal lead first</option>
+              <option value="workload">Workload</option>
+            </select>
+          </label>
         </div>
-        <div id="legend" class="legend" role="group" aria-label="Chart series"></div>
-        <figure class="plot">
-          <canvas id="chart" role="img" aria-labelledby="workload-title chart-caption"></canvas>
-          <p id="chart-empty" hidden></p>
-          <div id="chart-tooltip" aria-hidden="true" hidden></div>
-          <figcaption id="chart-caption" title="Simultaneous submissions in flight">Queue depth</figcaption>
-        </figure>
-        <details class="measurements">
-          <summary>Measurements <span id="measurement-count" class="technical"></span></summary>
-          <div class="table-scroll" tabindex="0" role="region" aria-label="Measured values">
-            <table>
-              <thead><tr><th>API</th><th>Depth</th><th>Median</th><th>p5–p95</th><th>n</th><th>vs Metal</th></tr></thead>
-              <tbody id="measurements"></tbody>
-            </table>
-          </div>
-        </details>
+        <div class="comparison-scroll" id="comparison-scroll" role="region" aria-label="Benchmark comparisons" tabindex="0">
+          <table class="comparison-table">
+            <colgroup>
+              <col class="comparison-workload-col"><col class="comparison-stack-col">
+              <col class="comparison-median-col"><col class="comparison-median-col"><col>
+            </colgroup>
+            <thead>
+              <tr>
+                <th scope="col">Workload</th>
+                <th scope="col" class="comparison-stack">Stack</th>
+                <th scope="col" class="comparison-median">Linux</th>
+                <th scope="col" class="comparison-median">Metal</th>
+                <th scope="col" class="comparison-ratio-heading">
+                  <span class="comparison-axis">
+                    <span>Metal leads <small id="axis-min"></small></span><span>1×</span><span>Linux leads <small id="axis-max"></small></span>
+                  </span>
+                  <span class="comparison-ratio-label">Ratio</span>
+                </th>
+              </tr>
+            </thead>
+            <tbody id="comparison-rows"></tbody>
+          </table>
+          <p id="comparison-empty" class="comparison-empty" hidden></p>
+        </div>
+        <p id="comparison-status" class="comparison-status" aria-live="polite"></p>
       </section>
+
+      <details id="workload-inspector" class="workload-inspector">
+        <summary>Inspect a workload <span id="inspector-device"></span></summary>
+        <section class="panel" aria-labelledby="workload-title">
+          <div class="filters">
+            <label>Workload<select id="workload"></select></label>
+            <label>Metric<select id="metric"></select></label>
+            <label>View<select id="view"><option value="raw">Measured values</option><option value="relative">Relative to Metal</option></select></label>
+          </div>
+          <div class="panel-heading">
+            <div>
+              <h2 id="workload-title"></h2>
+              <p id="workload-detail" class="technical"></p>
+            </div>
+            <span id="direction" class="technical"></span>
+          </div>
+          <div id="legend" class="legend" role="group" aria-label="Chart series"></div>
+          <figure class="plot">
+            <canvas id="chart" role="img" aria-labelledby="workload-title chart-caption"></canvas>
+            <p id="chart-empty" hidden></p>
+            <div id="chart-tooltip" aria-hidden="true" hidden></div>
+            <figcaption id="chart-caption" title="Simultaneous submissions in flight">Queue depth</figcaption>
+          </figure>
+          <details class="measurements">
+            <summary>Measurements <span id="measurement-count" class="technical"></span></summary>
+            <div class="table-scroll" tabindex="0" role="region" aria-label="Measured values">
+              <table>
+                <thead><tr><th>API</th><th>Depth</th><th>Median</th><th>p5–p95</th><th>n</th><th>vs Metal</th></tr></thead>
+                <tbody id="measurements"></tbody>
+              </table>
+            </div>
+          </details>
+        </section>
+      </details>
 
       <section class="records" aria-labelledby="records-title">
         <div class="section-heading">
@@ -77,10 +141,11 @@
         <div id="records" class="records-list"></div>
       </section>
 
-      <details class="methodology">
+      <details id="methodology" class="methodology">
         <summary>How comparisons are calculated</summary>
-        <p>Charts show measured medians. Metal-relative values compare the same device, workload, parameters, mode, queue depth and metric. Values above 1× favor Linux. The ratios invert metrics such as latency, where lower is better.</p>
-        <p>Driver builds, operating systems and run conditions vary. OpenGL workloads appear alongside Metal when matching measurements exist. See the run records for the exact source of each series.</p>
+        <p>Each comparison pairs one Linux API with Metal on the same chip, workload, parameters, mode, depth and primary metric. The table uses the newest run per API and configuration with a recorded, clean suite revision. Failed, skipped, ambiguous and incompatible results appear under Unmatched.</p>
+        <p>Ratios above 1× favor Linux. For metrics such as latency, the ratio is Metal time divided by Linux time. Bars use a logarithmic scale centered at 1×. Reciprocal ratios such as 0.5× and 2× extend the same distance in opposite directions.</p>
+        <p>Counts use the reported medians, and each depth counts separately. Look at the percentiles and sample counts in the workload inspector to judge how repeatable a lead may be. Driver builds, suite revisions, operating systems and run conditions vary.</p>
       </details>
     </section>
   </main>
