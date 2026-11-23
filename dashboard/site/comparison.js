@@ -22,6 +22,11 @@ export function relative(metric, reference) {
   return Number.isFinite(ratio) && ratio > 0 ? ratio : null;
 }
 
+export function geometricMeanRatio(ratios) {
+  if (!ratios.length) return null;
+  return Math.exp(ratios.reduce((sum, ratio) => sum + Math.log(ratio), 0) / ratios.length);
+}
+
 export function canCompare(run) {
   return Boolean(run?.suite && !run.suite.includes("+dirty"));
 }

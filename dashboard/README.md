@@ -1,6 +1,6 @@
 # GPU dashboard
 
-Production is [gpu.aurorasilicon.org](https://gpu.aurorasilicon.org), hosted on Cloudflare Pages. Site source and the public benchmark feed live on the `gpu-dashboard` branch of this repository. The dashboard follows the visitor's system appearance.
+Production is [gpu.aurorasilicon.org](https://gpu.aurorasilicon.org), hosted on Cloudflare Pages. Site source and the public benchmark feed live on the `gpu-dashboard` branch of this repository. The dashboard follows the visitor's system appearance and uses the official [Aurora Silicon mark](https://aurorasilicon.org/brand/aurora-silicon-mark.svg).
 
 ## Update benchmark results
 
@@ -19,7 +19,7 @@ The importer replaces the entry for that device, API and UTC timestamp. It proje
 
 The site reads the public GitHub feed on page load, so data-only commits appear after GitHub's cache refresh without a Pages upload. A copy of the feed ships with each deployment. Future imports require the saved artifacts from a device thread.
 
-The dashboard groups results by workload. Each section charts selected cases and includes a table of all results for that group. A coverage chart appears when the selected results have no valid Metal ratios. Filters, open tables, and the workload inspector are stored in the URL so shared links restore the view.
+The dashboard groups results by workload. Each section charts selected cases and includes a table of all results for that group. Average speed is the geometric mean across all matched cases in the current chip, API and search scope. A coverage chart appears when the selected results have no valid Metal ratios. Filters, open tables, and the workload inspector are stored in the URL so shared links restore the view.
 
 The comparison table selects the newest run with a recorded, clean suite revision per chip, API and configuration. It counts each paired depth once for each Linux API. The comparison uses the primary metric. Duplicate keys, failures and skipped results go to Unmatched. The workload chart selects one run per API per workload. Readers can select an older run from the Run Records section. Metal-relative values require matching device, lane, test, params, mode, depth, metric, unit and improvement direction. Runs with an unknown or dirty suite revision remain visible in measured mode. The table retains duplicate keys, skipped cases and failures. The chart omits those measurements.
 

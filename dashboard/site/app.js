@@ -1,5 +1,5 @@
-import { buildComparisons, canCompare, compatible, relative, workloadKey } from "./comparison.js?v=4";
-import { BENCHMARK_GROUPS, benchmarkGroup, selectChartCases } from "./groups.js?v=4";
+import { buildComparisons, canCompare, compatible, geometricMeanRatio, relative, workloadKey } from "./comparison.js?v=5";
+import { BENCHMARK_GROUPS, benchmarkGroup, selectChartCases } from "./groups.js?v=5";
 
 const DEVICES = [
   { id: "neo", name: "A18 Pro", model: "MacBook Neo" },
@@ -60,6 +60,9 @@ const comparisonApi = byId("comparison-api");
 const comparisonResult = byId("comparison-result");
 const comparisonSort = byId("comparison-sort");
 const percent = new Intl.NumberFormat(undefined, { style: "percent", maximumFractionDigits: 1 });
+const signedPercent = new Intl.NumberFormat(undefined, {
+  style: "percent", maximumFractionDigits: 1, signDisplay: "exceptZero",
+});
 const workloadSelect = byId("workload");
 const metricSelect = byId("metric");
 const viewSelect = byId("view");
@@ -282,10 +285,18 @@ function buildGroupSection(group, entries, scope) {
   const matched = scope.filter((entry) => entry.ratio != null);
   if (matched.length) {
     const wins = matched.filter((entry) => entry.outcome === "linux").length;
-    const score = node("div", null, "group-score");
-    score.append(node("strong", percent.format(wins / matched.length)),
+    const average = geometricMeanRatio(matched.map((entry) => entry.ratio));
+    const scores = node("div", null, "group-scores");
+    const averageClass = average > 1 ? "linux-lead" : average < 1 ? "metal-lead" : "";
+    const speed = node("div", null, "group-score group-average");
+    speed.title = `${ratioText(average)}× Metal · geometric mean of ${matched.length} matched results`;
+    speed.append(node("strong", signedPercent.format(average - 1), averageClass),
+      node("small", "Average vs Metal"));
+    const frequency = node("div", null, "group-score");
+    frequency.append(node("strong", percent.format(wins / matched.length), "linux-lead"),
       node("small", `Linux faster in ${wins}/${matched.length}`));
-    heading.append(score);
+    scores.append(speed, frequency);
+    heading.append(scores);
   }
   section.append(heading, chartCases.length ? buildGroupChart(group, chartCases) : buildCoverageChart(entries));
 

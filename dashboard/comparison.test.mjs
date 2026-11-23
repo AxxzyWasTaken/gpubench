@@ -1,6 +1,6 @@
 import assert from "node:assert/strict";
 import { test } from "node:test";
-import { buildComparisons, relative } from "./site/comparison.js";
+import { buildComparisons, geometricMeanRatio, relative } from "./site/comparison.js";
 import { BENCHMARK_GROUPS, benchmarkGroup, selectChartCases } from "./site/groups.js";
 
 const rate = (median) => ({ median, unit: "fps", better: "higher" });
@@ -95,4 +95,10 @@ test("group curation respects filtered cases and keeps different APIs and metric
   assert.ok(cases.every((selection) => selection.row.depth === 1));
   assert.deepEqual(selectChartCases(group, input.toReversed()), cases);
   assert.deepEqual(selectChartCases(group, [unmatched]), []);
+});
+
+test("average speed uses the geometric mean of every matched ratio", () => {
+  assert.equal(geometricMeanRatio([]), null);
+  assert.equal(geometricMeanRatio([0.5, 2]), 1);
+  assert.ok(Math.abs(geometricMeanRatio([0.5, 1, 8]) - Math.cbrt(4)) < 1e-12);
 });
