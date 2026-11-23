@@ -102,3 +102,17 @@ test("average speed uses the geometric mean of every matched ratio", () => {
   assert.equal(geometricMeanRatio([0.5, 2]), 1);
   assert.ok(Math.abs(geometricMeanRatio([0.5, 1, 8]) - Math.cbrt(4)) < 1e-12);
 });
+
+test("a recorded Metal skip for a Vulkan ray-tracing pipeline is unsupported", () => {
+  const scene = (trace, status) => result(100, {
+    lane: "rt", test: "rt.scene", params: { preset: "medium", trace }, depth: 2, status,
+  });
+  const linux = run("vulkan", [scene("pipeline", "ok"), scene("query", "ok")]);
+  const metal = run("metal", [scene("pipeline", "skip"), scene("query", "skip")]);
+  const pairs = buildComparisons([linux, metal]);
+  assert.deepEqual(pairs.map(({ ratio, reason }) => [ratio, reason]), [
+    [null, "Vulkan only · Metal unsupported"], [null, "Failed or skipped"],
+  ]);
+  const laterMetal = run("metal", [scene("pipeline", "ok")], { date: "2026-11-22" });
+  assert.equal(buildComparisons([linux, metal, laterMetal])[0].ratio, 1);
+});

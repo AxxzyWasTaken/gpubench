@@ -8,7 +8,7 @@
   <title>GPU Benchmarks · Aurora Silicon</title>
   <link rel="icon" href="./aurora-silicon-mark.svg" type="image/svg+xml">
   <link rel="stylesheet" href="./style.css?v=5">
-  <script src="./app.js?v=5" type="module"></script>
+  <script src="./app.js?v=6" type="module"></script>
 </head>
 <body>
   <header class="masthead">
@@ -169,7 +169,7 @@
 
       <details id="methodology" class="methodology">
         <summary>How comparisons are calculated</summary>
-        <p>Each comparison pairs one Linux API with Metal on the same chip, workload, parameters, mode, depth and primary metric. The table uses the newest run per API and configuration with a recorded, clean suite revision. Failed, skipped, ambiguous and incompatible results appear under Unmatched.</p>
+        <p>Each comparison pairs one Linux API with Metal on the same chip, workload, parameters, mode, depth and primary metric. The table uses the newest run per API and configuration with a recorded, clean suite revision. Failed, skipped, ambiguous and incompatible results appear under Unmatched. The Metal executor records Vulkan-only ray-tracing pipeline scenes as unsupported.</p>
         <p>Ratios above 1× favor Linux. For metrics such as latency, the ratio is Metal time divided by Linux time. Bars use a logarithmic scale centered at 1×. Reciprocal ratios such as 0.5× and 2× extend the same distance in opposite directions.</p>
         <p>Average speed is the geometric mean of the ratios for all matched results in the group. Wins, losses and ties all contribute, and each depth counts separately. Counts use the reported medians. Look at the percentiles and sample counts in the workload inspector to judge how repeatable a lead may be. Driver builds, suite revisions, operating systems and run conditions vary.</p>
         <p>Group charts show selected cases from the active filters. Every dot is one matched result. Each chart shares a Metal baseline of 1×, and its scale adjusts to the cases shown. Expand the measurements to see every result in that group.</p>

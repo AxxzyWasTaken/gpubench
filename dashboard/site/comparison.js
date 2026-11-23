@@ -58,6 +58,12 @@ function metricFor(entry) {
   return entry.row.metrics[entry.row.primary];
 }
 
+export function metalPipelineUnsupported(row) {
+  // The Metal executor emits a skip for Vulkan ray-tracing pipeline scenes.
+  return row.status === "skip" && row.lane === "rt" &&
+    row.test === "rt.scene" && row.params.trace === "pipeline";
+}
+
 function compareSources(linuxSources, metalSources) {
   const linux = linuxSources?.eligible ?? linuxSources?.latest;
   const metal = metalSources?.eligible ?? metalSources?.latest;
@@ -67,6 +73,7 @@ function compareSources(linuxSources, metalSources) {
   let ratio = null;
   if (!linux || !metal) reason = linux ? "Metal missing" : "Linux missing";
   else if (linux.duplicate || metal.duplicate) reason = "Duplicate result key";
+  else if (linuxMetric && metalPipelineUnsupported(metal.row)) reason = "Vulkan only · Metal unsupported";
   else if (linux.row.status !== "ok" || metal.row.status !== "ok") reason = "Failed or skipped";
   else if (!linuxSources.eligible || !metalSources.eligible) reason = "Suite revision unavailable";
   else if (linux.row.primary !== metal.row.primary) reason = "Different primary metrics";

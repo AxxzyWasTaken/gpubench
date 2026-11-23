@@ -1,5 +1,5 @@
-import { buildComparisons, canCompare, compatible, geometricMeanRatio, relative, workloadKey } from "./comparison.js?v=5";
-import { BENCHMARK_GROUPS, benchmarkGroup, selectChartCases } from "./groups.js?v=5";
+import { buildComparisons, canCompare, compatible, geometricMeanRatio, metalPipelineUnsupported, relative, workloadKey } from "./comparison.js?v=6";
+import { BENCHMARK_GROUPS, benchmarkGroup, selectChartCases } from "./groups.js?v=6";
 
 const DEVICES = [
   { id: "neo", name: "A18 Pro", model: "MacBook Neo" },
@@ -608,7 +608,8 @@ function renderMeasurements(series) {
     for (const row of [...(record.rows ?? [])].sort((a, b) => a.depth - b.depth || a.line - b.line)) {
       const value = row.metrics?.[metricSelect.value];
       const point = record.points.find((item) => item.depth === row.depth);
-      const status = { skip: "Skipped", fail: "Failed", ok: "Unavailable" }[row.status];
+      const status = record.id === "metal" && metalPipelineUnsupported(row)
+        ? "Unsupported" : { skip: "Skipped", fail: "Failed", ok: "Unavailable" }[row.status];
       const duplicate = counts.get(row.depth) > 1;
       const cells = [
         record.name,
