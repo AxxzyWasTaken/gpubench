@@ -1,4 +1,4 @@
-import { buildComparisons, canCompare, compatible, relative, workloadKey } from "./comparison.js";
+import { buildComparisons, canCompare, compatible, relative, workloadKey } from "./comparison.js?v=2";
 
 const DEVICES = [
   { id: "neo", name: "A18 Pro", model: "MacBook Neo" },

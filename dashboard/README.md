@@ -23,7 +23,7 @@ The comparison table selects the newest run with a recorded, clean suite revisio
 
 ## Deploy the site
 
-From this repository's `gpu-dashboard` branch, run:
+Bump the version query on changed CSS and JavaScript URLs before deploying UI changes. This lets browsers pick up the new files on the custom domain. From this repository's `gpu-dashboard` branch, run:
 
 ```sh
 cd dashboard
