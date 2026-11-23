@@ -5,6 +5,7 @@ const DEVICES = [
   { id: "neo", name: "A18 Pro", model: "MacBook Neo" },
   { id: "m5-pro", name: "M5 Pro", model: "MacBook Pro" },
   { id: "m4-mini", name: "M4", model: "Mac mini" },
+  { id: "j616s", name: "M4 Pro", model: "MacBook Pro" },
   { id: "j615", name: "M3", model: "MacBook Air" },
   { id: "j413", name: "M2", model: "MacBook Air" },
   { id: "m1pro", name: "M1 Pro", model: "MacBook Pro" },
