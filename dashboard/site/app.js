@@ -5,6 +5,12 @@ const DEVICES = [
   { id: "neo", name: "A18 Pro", model: "MacBook Neo" },
   { id: "m5-pro", name: "M5 Pro", model: "MacBook Pro" },
   { id: "m4-mini", name: "M4", model: "Mac mini" },
+  { id: "j616s", name: "M4 Pro", model: "MacBook Pro" },
+  { id: "j713", name: "M4 Air", model: "MacBook Air" },
+  { id: "j615", name: "M3 Air 15-inch", model: "MacBook Air" },
+  { id: "j413", name: "M2", model: "MacBook Air" },
+  { id: "m1pro", name: "M1 Pro", model: "MacBook Pro" },
+  { id: "j700", name: "A18 Pro (lab)", model: "MacBook Neo (Aurora lab)" },
   { id: "j775c", name: "M5 Max", model: "Mac Studio" },
   { id: "j613", name: "M3", model: "MacBook Air 13-inch (J613)" },
 ];
